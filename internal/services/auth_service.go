@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/TheAmgadX/Spill-Social-Media-Platform/internal/auth"
@@ -17,15 +15,13 @@ import (
 var (
 	ErrInvalidCredentials = errors.New("invalid or expired verification code")
 	ErrTooManyAttempts    = errors.New("maximum verification attempts exceeded")
-	ErrInvalidUsername   = errors.New("username must be 3-20 characters long and contain only lowercase letters, numbers, and underscores")
-	ErrInvalidDisplayName = errors.New("display name must be between 1 and 50 characters")
-	ErrInvalidBirthdate   = errors.New("invalid birthdate format, expected YYYY-MM-DD")
-	ErrUnderage           = errors.New("users must be at least 13 years old to sign up")
+	ErrInvalidUsername    = fmt.Errorf("%w: username must be 3-20 characters long and contain only lowercase letters, numbers, and underscores", ErrValidation)
+	ErrInvalidDisplayName = fmt.Errorf("%w: display name must be between 1 and 50 characters", ErrValidation)
+	ErrInvalidBirthdate   = fmt.Errorf("%w: invalid birthdate format, expected YYYY-MM-DD", ErrValidation)
+	ErrUnderage           = fmt.Errorf("%w: users must be at least 13 years old to sign up", ErrValidation)
 	ErrTokenRevoked       = errors.New("refresh token has been revoked")
 	ErrTokenExpired       = errors.New("refresh token has expired")
 )
-
-var usernameRegex = regexp.MustCompile(`^[a-z0-9_]{3,20}$`)
 
 type AuthRepository interface {
 	CheckLoginCodeCooldown(ctx context.Context, email string, cooldown time.Duration) (bool, error)
@@ -73,9 +69,9 @@ type AuthTokens struct {
 
 // RequestCode validates email, generates a 6-digit code, hashes it with HMAC-SHA256,
 // enforces a 60-second cooldown in the database, and sends it via mailer.
-// Always returns nil (HTTP 202) regardless of whether the email was valid or on cooldown.
+// Always returns nil (HTTP 202) regardless of whether the email was valid or on cooldown to prevent email enumeration.
 func (s *AuthService) RequestCode(ctx context.Context, rawEmail string) error {
-	normalizedEmail, err := auth.NormalizeEmail(rawEmail)
+	normalizedEmail, err := ValidateRequestCode(rawEmail)
 	if err != nil {
 		// Return without error to maintain constant response and prevent email enumeration
 		return nil
@@ -117,14 +113,9 @@ func (s *AuthService) RequestCode(ctx context.Context, rawEmail string) error {
 
 // VerifyCode verifies the latest unconsumed, unexpired code for an email.
 func (s *AuthService) VerifyCode(ctx context.Context, rawEmail string, rawCode string, userAgent string) (*VerifyResult, error) {
-	normalizedEmail, err := auth.NormalizeEmail(rawEmail)
+	normalizedEmail, code, cleanUA, err := ValidateVerifyCode(rawEmail, rawCode, userAgent)
 	if err != nil {
-		return nil, ErrInvalidCredentials
-	}
-
-	code := strings.TrimSpace(rawCode)
-	if len(code) != 6 {
-		return nil, ErrInvalidCredentials
+		return nil, err
 	}
 
 	activeCode, err := s.repo.GetLatestActiveCode(ctx, normalizedEmail)
@@ -174,8 +165,8 @@ func (s *AuthService) VerifyCode(ctx context.Context, rawEmail string, rawCode s
 
 		tokenHash := auth.HashRefreshToken(rawRefreshToken)
 		var ua *string
-		if userAgent != "" {
-			ua = &userAgent
+		if cleanUA != "" {
+			ua = &cleanUA
 		}
 		expiresAt := time.Now().Add(s.cfg.RefreshTokenTTL)
 
@@ -205,42 +196,20 @@ func (s *AuthService) VerifyCode(ctx context.Context, rawEmail string, rawCode s
 
 // Signup creates a new user from a valid signup token.
 func (s *AuthService) Signup(ctx context.Context, signupToken, username, displayName, birthdateStr, userAgent string) (*AuthTokens, *models.User, error) {
-	claims, err := auth.ParseAndVerifySignupToken(signupToken, s.cfg.JWTSecret)
+	token, cleanUsername, cleanDisplayName, birthdate, cleanUA, err := ValidateSignup(signupToken, username, displayName, birthdateStr, userAgent)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	claims, err := auth.ParseAndVerifySignupToken(token, s.cfg.JWTSecret)
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid signup token: %w", err)
 	}
 
 	email := claims.Email
 
-	// Validate username: ^[a-z0-9_]{3,20}$
-	username = strings.TrimSpace(username)
-	if !usernameRegex.MatchString(username) {
-		return nil, nil, ErrInvalidUsername
-	}
-
-	// Validate display name: 1 to 50 characters
-	displayName = strings.TrimSpace(displayName)
-	if len(displayName) < 1 || len(displayName) > 50 {
-		return nil, nil, ErrInvalidDisplayName
-	}
-
-	// Validate birthdate
-	birthdate, err := time.Parse("2006-01-02", strings.TrimSpace(birthdateStr))
-	if err != nil {
-		return nil, nil, ErrInvalidBirthdate
-	}
-	if !birthdate.After(time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)) {
-		return nil, nil, errors.New("birthdate must be after 1900-01-01")
-	}
-
-	// Require age 13 or older
-	age := auth.CalculateAge(birthdate, time.Now())
-	if age < 13 {
-		return nil, nil, ErrUnderage
-	}
-
 	// Create user
-	user, err := s.repo.CreateUser(ctx, username, email, displayName, birthdate, "user")
+	user, err := s.repo.CreateUser(ctx, cleanUsername, email, cleanDisplayName, birthdate, "user")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -259,8 +228,8 @@ func (s *AuthService) Signup(ctx context.Context, signupToken, username, display
 
 	tokenHash := auth.HashRefreshToken(rawRefreshToken)
 	var ua *string
-	if userAgent != "" {
-		ua = &userAgent
+	if cleanUA != "" {
+		ua = &cleanUA
 	}
 	expiresAt := time.Now().Add(s.cfg.RefreshTokenTTL)
 
@@ -277,12 +246,12 @@ func (s *AuthService) Signup(ctx context.Context, signupToken, username, display
 // RefreshToken rotates the presented refresh token and issues a new access token.
 // If a revoked token is presented, all refresh tokens for that user are immediately revoked (reuse detection).
 func (s *AuthService) RefreshToken(ctx context.Context, rawRefreshToken, userAgent string) (*AuthTokens, error) {
-	rawRefreshToken = strings.TrimSpace(rawRefreshToken)
-	if rawRefreshToken == "" {
-		return nil, auth.ErrInvalidToken
+	cleanRefreshToken, cleanUA, err := ValidateRefreshToken(rawRefreshToken, userAgent)
+	if err != nil {
+		return nil, err
 	}
 
-	tokenHash := auth.HashRefreshToken(rawRefreshToken)
+	tokenHash := auth.HashRefreshToken(cleanRefreshToken)
 	tokenRecord, err := s.repo.FindRefreshTokenByHash(ctx, tokenHash)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
@@ -322,8 +291,8 @@ func (s *AuthService) RefreshToken(ctx context.Context, rawRefreshToken, userAge
 
 	newTokenHash := auth.HashRefreshToken(newRawRefreshToken)
 	var ua *string
-	if userAgent != "" {
-		ua = &userAgent
+	if cleanUA != "" {
+		ua = &cleanUA
 	}
 	newExpiresAt := time.Now().Add(s.cfg.RefreshTokenTTL)
 
@@ -344,10 +313,10 @@ func (s *AuthService) RefreshToken(ctx context.Context, rawRefreshToken, userAge
 
 // Logout revokes the presented refresh token.
 func (s *AuthService) Logout(ctx context.Context, rawRefreshToken string) error {
-	rawRefreshToken = strings.TrimSpace(rawRefreshToken)
-	if rawRefreshToken == "" {
-		return nil
+	cleanRefreshToken, err := ValidateLogout(rawRefreshToken)
+	if err != nil {
+		return err
 	}
-	tokenHash := auth.HashRefreshToken(rawRefreshToken)
+	tokenHash := auth.HashRefreshToken(cleanRefreshToken)
 	return s.repo.RevokeRefreshTokenByHash(ctx, tokenHash)
 }

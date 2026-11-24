@@ -14,11 +14,11 @@ import (
 
 func TestStorage_CreateSignedUploadURL(t *testing.T) {
 	tests := []struct {
-		name           string
-		handler        http.HandlerFunc
-		expectedURL    string
-		expectErr      bool
-		errContains    string
+		name        string
+		handler     http.HandlerFunc
+		expectedURL string
+		expectErr   bool
+		errContains string
 	}{
 		{
 			name: "Success with absolute URL",

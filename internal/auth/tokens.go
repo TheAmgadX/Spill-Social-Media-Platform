@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	ErrInvalidToken       = errors.New("invalid or expired token")
-	ErrUnexpectedAlg      = errors.New("unexpected signing algorithm")
+	ErrInvalidToken        = errors.New("invalid or expired token")
+	ErrUnexpectedAlg       = errors.New("unexpected signing algorithm")
 	ErrInvalidTokenPurpose = errors.New("invalid token purpose")
 )
 

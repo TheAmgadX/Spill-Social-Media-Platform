@@ -59,20 +59,20 @@ func (s *CommentService) ToCommentResponse(c *models.CommentDetail) views.Commen
 }
 
 func (s *CommentService) CreateComment(ctx context.Context, currentUserID, postID, body string) (*views.CommentResponse, error) {
-	l := len([]rune(body))
-	if l < 1 || l > 1000 {
-		return nil, fmt.Errorf("%w: comment body must be between 1 and 1000 characters", ErrValidation)
+	cleanUserID, cleanPostID, cleanBody, err := ValidateCreateComment(currentUserID, postID, body)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify post exists and is not soft-deleted
-	if _, err := s.repo.GetPostByID(ctx, postID, nil); err != nil {
+	if _, err := s.repo.GetPostByID(ctx, cleanPostID, nil); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 
-	comment, err := s.repo.CreateComment(ctx, postID, currentUserID, body)
+	comment, err := s.repo.CreateComment(ctx, cleanPostID, cleanUserID, cleanBody)
 	if err != nil {
 		return nil, err
 	}
@@ -82,33 +82,27 @@ func (s *CommentService) CreateComment(ctx context.Context, currentUserID, postI
 }
 
 func (s *CommentService) GetComments(ctx context.Context, postID string, limit int, cursorStr string) (*views.CommentListResponse, error) {
+	cleanPostID, cleanLimit, cursorTime, cursorID, err := ValidateGetComments(postID, limit, cursorStr)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verify post exists and is not soft-deleted
-	if _, err := s.repo.GetPostByID(ctx, postID, nil); err != nil {
+	if _, err := s.repo.GetPostByID(ctx, cleanPostID, nil); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 
-	var cursorTime *time.Time
-	var cursorID string
-	if cursorStr != "" {
-		t, id, err := views.DecodeCursor(cursorStr)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid cursor", ErrValidation)
-		}
-		cursorTime = &t
-		cursorID = id
-	}
-
-	comments, err := s.repo.GetCommentsByPostID(ctx, postID, limit+1, cursorTime, cursorID)
+	comments, err := s.repo.GetCommentsByPostID(ctx, cleanPostID, cleanLimit+1, cursorTime, cursorID)
 	if err != nil {
 		return nil, err
 	}
 
-	hasMore := len(comments) > limit
+	hasMore := len(comments) > cleanLimit
 	if hasMore {
-		comments = comments[:limit]
+		comments = comments[:cleanLimit]
 	}
 
 	var data []views.CommentResponse
@@ -127,14 +121,19 @@ func (s *CommentService) GetComments(ctx context.Context, postID string, limit i
 		Data: data,
 		Pagination: views.PaginationMeta{
 			NextCursor: nextCursor,
-			Limit:      limit,
+			Limit:      cleanLimit,
 			HasMore:    hasMore,
 		},
 	}, nil
 }
 
 func (s *CommentService) DeleteComment(ctx context.Context, commentID, currentUserID, userRole string) error {
-	comment, err := s.repo.GetCommentByID(ctx, commentID)
+	cleanCommentID, cleanUserID, cleanRole, err := ValidateDeleteComment(commentID, currentUserID, userRole)
+	if err != nil {
+		return err
+	}
+
+	comment, err := s.repo.GetCommentByID(ctx, cleanCommentID)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return ErrNotFound
@@ -146,9 +145,9 @@ func (s *CommentService) DeleteComment(ctx context.Context, commentID, currentUs
 		return ErrNotFound
 	}
 
-	if comment.AuthorID != currentUserID && userRole != "admin" {
+	if comment.AuthorID != cleanUserID && cleanRole != "admin" {
 		return ErrForbidden
 	}
 
-	return s.repo.SoftDeleteComment(ctx, commentID)
+	return s.repo.SoftDeleteComment(ctx, cleanCommentID)
 }

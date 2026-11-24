@@ -753,7 +753,11 @@ func TestService_OwnershipRules(t *testing.T) {
 		repo := newFakePostRepo()
 		svc := services.NewPostService(repo, "https://storage.local")
 
-		post, _ := repo.CreatePost(ctx, "author-1", "Initial body", nil)
+		authorID := uuid.NewString()
+		adminID := uuid.NewString()
+		intruderID := uuid.NewString()
+
+		post, _ := repo.CreatePost(ctx, authorID, "Initial body", nil)
 
 		tests := []struct {
 			name        string
@@ -761,9 +765,9 @@ func TestService_OwnershipRules(t *testing.T) {
 			role        string
 			expectError error
 		}{
-			{"Author can edit", "author-1", "user", nil},
-			{"Admin can edit", "admin-1", "admin", nil},
-			{"Non-author non-admin cannot edit", "intruder-1", "user", services.ErrForbidden},
+			{"Author can edit", authorID, "user", nil},
+			{"Admin can edit", adminID, "admin", nil},
+			{"Non-author non-admin cannot edit", intruderID, "user", services.ErrForbidden},
 		}
 
 		for _, tt := range tests {
@@ -777,22 +781,26 @@ func TestService_OwnershipRules(t *testing.T) {
 	})
 
 	t.Run("PostService_DeletePost_Ownership", func(t *testing.T) {
+		authorID := uuid.NewString()
+		adminID := uuid.NewString()
+		intruderID := uuid.NewString()
+
 		tests := []struct {
 			name        string
 			userID      string
 			role        string
 			expectError error
 		}{
-			{"Author can delete", "author-1", "user", nil},
-			{"Admin can delete", "admin-1", "admin", nil},
-			{"Non-author cannot delete", "intruder-1", "user", services.ErrForbidden},
+			{"Author can delete", authorID, "user", nil},
+			{"Admin can delete", adminID, "admin", nil},
+			{"Non-author cannot delete", intruderID, "user", services.ErrForbidden},
 		}
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				repo := newFakePostRepo()
 				svc := services.NewPostService(repo, "https://storage.local")
-				post, _ := repo.CreatePost(ctx, "author-1", "Post to delete", nil)
+				post, _ := repo.CreatePost(ctx, authorID, "Post to delete", nil)
 
 				err := svc.DeletePost(ctx, post.ID, tt.userID, tt.role)
 				if !errors.Is(err, tt.expectError) {
@@ -803,22 +811,27 @@ func TestService_OwnershipRules(t *testing.T) {
 	})
 
 	t.Run("CommentService_DeleteComment_Ownership", func(t *testing.T) {
+		postID := uuid.NewString()
+		commenterID := uuid.NewString()
+		adminID := uuid.NewString()
+		otherUserID := uuid.NewString()
+
 		tests := []struct {
 			name        string
 			userID      string
 			role        string
 			expectError error
 		}{
-			{"Author can delete comment", "commenter-1", "user", nil},
-			{"Admin can delete comment", "admin-1", "admin", nil},
-			{"Non-author cannot delete comment", "other-user", "user", services.ErrForbidden},
+			{"Author can delete comment", commenterID, "user", nil},
+			{"Admin can delete comment", adminID, "admin", nil},
+			{"Non-author cannot delete comment", otherUserID, "user", services.ErrForbidden},
 		}
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				repo := newFakeCommentRepo()
 				svc := services.NewCommentService(repo, "https://storage.local")
-				comm, _ := repo.CreateComment(ctx, "post-1", "commenter-1", "Nice post")
+				comm, _ := repo.CreateComment(ctx, postID, commenterID, "Nice post")
 
 				err := svc.DeleteComment(ctx, comm.ID, tt.userID, tt.role)
 				if !errors.Is(err, tt.expectError) {
@@ -829,15 +842,20 @@ func TestService_OwnershipRules(t *testing.T) {
 	})
 
 	t.Run("AssetService_CompleteAsset_Ownership", func(t *testing.T) {
+		assetID := uuid.NewString()
+		ownerID := uuid.NewString()
+		adminID := uuid.NewString()
+		intruderID := uuid.NewString()
+
 		tests := []struct {
 			name        string
 			userID      string
 			role        string
 			expectError error
 		}{
-			{"Owner can complete asset", "owner-1", "user", nil},
-			{"Admin can complete asset", "admin-1", "admin", nil},
-			{"Non-owner non-admin cannot complete asset", "intruder-1", "user", services.ErrForbidden},
+			{"Owner can complete asset", ownerID, "user", nil},
+			{"Admin can complete asset", adminID, "admin", nil},
+			{"Non-owner non-admin cannot complete asset", intruderID, "user", services.ErrForbidden},
 		}
 
 		for _, tt := range tests {
@@ -846,7 +864,7 @@ func TestService_OwnershipRules(t *testing.T) {
 				store := newMockStorageClient()
 				svc := services.NewAssetService(repo, store, "media", "https://storage.local")
 
-				asset, _ := repo.CreateAsset(ctx, "asset-1", "owner-1", "post_image", "media", "u/owner-1/asset-1.png", "image/png", 1024)
+				asset, _ := repo.CreateAsset(ctx, assetID, ownerID, "post_image", "media", fmt.Sprintf("u/%s/%s.png", ownerID, assetID), "image/png", 1024)
 				store.objects[asset.StorageKey] = 1024
 
 				_, err := svc.CompleteAsset(ctx, asset.ID, tt.userID, tt.role)
@@ -908,9 +926,9 @@ func TestAuthService_RequestCooldown(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name                 string
-		hasRecentCode        bool
-		expectedEmailsSent   int
+		name               string
+		hasRecentCode      bool
+		expectedEmailsSent int
 	}{
 		{
 			name:               "First request sends email",
@@ -1105,22 +1123,24 @@ func TestServices_AdditionalRules(t *testing.T) {
 	t.Run("PostService_Creation_Validation", func(t *testing.T) {
 		repo := newFakePostRepo()
 		svc := services.NewPostService(repo, "https://storage.local")
+		authorID := uuid.NewString()
+		assetID := uuid.NewString()
 
 		// Both empty
-		_, err := svc.CreatePost(ctx, "author", "   ", []string{})
+		_, err := svc.CreatePost(ctx, authorID, "   ", []string{})
 		if !errors.Is(err, services.ErrValidation) {
 			t.Errorf("expected ErrValidation on empty body and no images, got %v", err)
 		}
 
 		// Body too long (> 2000 chars)
 		longBody := strings.Repeat("a", 2001)
-		_, err = svc.CreatePost(ctx, "author", longBody, nil)
+		_, err = svc.CreatePost(ctx, authorID, longBody, nil)
 		if !errors.Is(err, services.ErrValidation) {
 			t.Errorf("expected ErrValidation on body > 2000 chars, got %v", err)
 		}
 
 		// Valid image only
-		p, err := svc.CreatePost(ctx, "author", "", []string{"asset-1"})
+		p, err := svc.CreatePost(ctx, authorID, "", []string{assetID})
 		if err != nil || p == nil {
 			t.Fatalf("expected success with asset only, got %v", err)
 		}
@@ -1129,24 +1149,27 @@ func TestServices_AdditionalRules(t *testing.T) {
 	t.Run("PostService_SharePost_Validation", func(t *testing.T) {
 		repo := newFakePostRepo()
 		svc := services.NewPostService(repo, "https://storage.local")
-		p, _ := repo.CreatePost(ctx, "author", "Post to share", nil)
+		authorID := uuid.NewString()
+		userID := uuid.NewString()
+		nonExistentID := uuid.NewString()
+		p, _ := repo.CreatePost(ctx, authorID, "Post to share", nil)
 
 		// Quote > 500
 		longQuote := strings.Repeat("q", 501)
-		_, err := svc.SharePost(ctx, "user-1", p.ID, &longQuote)
+		_, err := svc.SharePost(ctx, userID, p.ID, &longQuote)
 		if !errors.Is(err, services.ErrValidation) {
 			t.Errorf("expected ErrValidation on quote > 500, got %v", err)
 		}
 
 		// Non-existent post
 		quote := "Nice"
-		_, err = svc.SharePost(ctx, "user-1", "non-existent", &quote)
+		_, err = svc.SharePost(ctx, userID, nonExistentID, &quote)
 		if !errors.Is(err, services.ErrNotFound) {
 			t.Errorf("expected ErrNotFound on nonexistent post share, got %v", err)
 		}
 
 		// Valid share
-		sh, err := svc.SharePost(ctx, "user-1", p.ID, &quote)
+		sh, err := svc.SharePost(ctx, userID, p.ID, &quote)
 		if err != nil || sh == nil {
 			t.Fatalf("expected valid share, got %v", err)
 		}
@@ -1155,8 +1178,9 @@ func TestServices_AdditionalRules(t *testing.T) {
 	t.Run("UserService_Follow_SelfFollow", func(t *testing.T) {
 		repo := newFakeUserRepo()
 		svc := services.NewUserService(repo, "https://storage.local")
+		userID := uuid.NewString()
 
-		_, err := svc.FollowUser(ctx, "user-1", "user-1")
+		_, err := svc.FollowUser(ctx, userID, userID)
 		if !errors.Is(err, services.ErrSelfFollow) {
 			t.Errorf("expected ErrSelfFollow, got %v", err)
 		}
@@ -1166,27 +1190,28 @@ func TestServices_AdditionalRules(t *testing.T) {
 		repo := newFakeAssetRepo()
 		store := newMockStorageClient()
 		svc := services.NewAssetService(repo, store, "media", "https://storage.local")
+		ownerID := uuid.NewString()
 
 		// Size > 5MB
-		_, _, err := svc.CreateAsset(ctx, "user", "post_image", "image/png", 5242881)
+		_, _, err := svc.CreateAsset(ctx, ownerID, "post_image", "image/png", 5242881)
 		if !errors.Is(err, services.ErrPayloadTooLarge) {
 			t.Errorf("expected ErrPayloadTooLarge, got %v", err)
 		}
 
 		// Size < 1
-		_, _, err = svc.CreateAsset(ctx, "user", "post_image", "image/png", 0)
+		_, _, err = svc.CreateAsset(ctx, ownerID, "post_image", "image/png", 0)
 		if !errors.Is(err, services.ErrValidation) {
 			t.Errorf("expected ErrValidation on size < 1, got %v", err)
 		}
 
 		// Invalid mime type
-		_, _, err = svc.CreateAsset(ctx, "user", "post_image", "image/gif", 1024)
+		_, _, err = svc.CreateAsset(ctx, ownerID, "post_image", "image/gif", 1024)
 		if !errors.Is(err, services.ErrValidation) {
 			t.Errorf("expected ErrValidation on invalid mime, got %v", err)
 		}
 
 		// Invalid kind
-		_, _, err = svc.CreateAsset(ctx, "user", "invalid_kind", "image/png", 1024)
+		_, _, err = svc.CreateAsset(ctx, ownerID, "invalid_kind", "image/png", 1024)
 		if !errors.Is(err, services.ErrValidation) {
 			t.Errorf("expected ErrValidation on invalid kind, got %v", err)
 		}
@@ -1225,8 +1250,13 @@ func TestUserService_FullSuite(t *testing.T) {
 	repo := newFakeUserRepo()
 	svc := services.NewUserService(repo, "https://storage.local")
 
+	u1ID := uuid.NewString()
+	u2ID := uuid.NewString()
+	aid := uuid.NewString()
+	nonExistentID := uuid.NewString()
+
 	u1 := &models.UserDetail{
-		ID:             "u1",
+		ID:             u1ID,
 		Username:       "alice",
 		Email:          "alice@example.com",
 		DisplayName:    "Alice",
@@ -1237,16 +1267,16 @@ func TestUserService_FullSuite(t *testing.T) {
 		CreatedAt:      time.Now(),
 	}
 	u2 := &models.UserDetail{
-		ID:             "u2",
-		Username:       "bob",
-		Email:          "bob@example.com",
-		DisplayName:    "Bob",
-		Birthdate:      time.Date(1998, 2, 2, 0, 0, 0, 0, time.UTC),
-		Role:           "user",
-		CreatedAt:      time.Now(),
+		ID:          u2ID,
+		Username:    "bob",
+		Email:       "bob@example.com",
+		DisplayName: "Bob",
+		Birthdate:   time.Date(1998, 2, 2, 0, 0, 0, 0, time.UTC),
+		Role:        "user",
+		CreatedAt:   time.Now(),
 	}
-	repo.users["u1"] = u1
-	repo.users["u2"] = u2
+	repo.users[u1ID] = u1
+	repo.users[u2ID] = u2
 
 	// GetProfile
 	p, err := svc.GetProfile(ctx, "alice")
@@ -1259,82 +1289,81 @@ func TestUserService_FullSuite(t *testing.T) {
 	}
 
 	// GetMe
-	me, err := svc.GetMe(ctx, "u1")
+	me, err := svc.GetMe(ctx, u1ID)
 	if err != nil || me.Email != "alice@example.com" {
 		t.Fatalf("failed GetMe: %v", err)
 	}
-	_, err = svc.GetMe(ctx, "nonexistent")
+	_, err = svc.GetMe(ctx, nonExistentID)
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound for nonexistent me, got %v", err)
 	}
 
 	// UpdateMe
 	longName := strings.Repeat("n", 51)
-	_, err = svc.UpdateMe(ctx, "u1", &longName, nil, false)
+	_, err = svc.UpdateMe(ctx, u1ID, &longName, nil, false)
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on long displayName, got %v", err)
 	}
 	emptyName := ""
-	_, err = svc.UpdateMe(ctx, "u1", &emptyName, nil, false)
+	_, err = svc.UpdateMe(ctx, u1ID, &emptyName, nil, false)
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on empty displayName, got %v", err)
 	}
 	newName := "Alice New"
-	aid := "avatar-123"
-	updated, err := svc.UpdateMe(ctx, "u1", &newName, &aid, false)
+	updated, err := svc.UpdateMe(ctx, u1ID, &newName, &aid, false)
 	if err != nil || updated.DisplayName != "Alice New" {
 		t.Fatalf("failed UpdateMe: %v", err)
 	}
-	cleared, err := svc.UpdateMe(ctx, "u1", nil, nil, true)
+	cleared, err := svc.UpdateMe(ctx, u1ID, nil, nil, true)
 	if err != nil || cleared.AvatarURL != nil {
 		t.Fatalf("failed clearing avatar: %v", err)
 	}
 
 	// Follow & Unfollow
-	_, err = svc.FollowUser(ctx, "u1", "nonexistent")
+	_, err = svc.FollowUser(ctx, u1ID, nonExistentID)
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound following nonexistent user, got %v", err)
 	}
-	ok, err := svc.FollowUser(ctx, "u1", "u2")
+	ok, err := svc.FollowUser(ctx, u1ID, u2ID)
 	if err != nil || !ok {
 		t.Fatalf("failed follow user: %v", err)
 	}
 
-	_, err = svc.UnfollowUser(ctx, "u1", "nonexistent")
+	_, err = svc.UnfollowUser(ctx, u1ID, nonExistentID)
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound unfollowing nonexistent user, got %v", err)
 	}
-	ok, err = svc.UnfollowUser(ctx, "u1", "u2")
+	ok, err = svc.UnfollowUser(ctx, u1ID, u2ID)
 	if err != nil || ok {
 		t.Fatalf("failed unfollow user: %v", err)
 	}
 
 	// Re-follow for followers list test
-	_, _ = svc.FollowUser(ctx, "u1", "u2")
+	_, _ = svc.FollowUser(ctx, u1ID, u2ID)
 
 	// GetFollowers & GetFollowing
-	fList, err := svc.GetFollowers(ctx, "u2", 10, "")
+	fList, err := svc.GetFollowers(ctx, u2ID, 10, "")
 	if err != nil || len(fList.Data) == 0 {
 		t.Fatalf("failed GetFollowers: %v", err)
 	}
-	_, err = svc.GetFollowers(ctx, "nonexistent", 10, "")
+	_, err = svc.GetFollowers(ctx, nonExistentID, 10, "")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on GetFollowers for nonexistent user, got %v", err)
 	}
-	_, err = svc.GetFollowers(ctx, "u2", 10, "invalid-cursor-encoding")
+	_, err = svc.GetFollowers(ctx, u2ID, 10, "invalid-cursor-encoding")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on invalid cursor, got %v", err)
 	}
 
-	followingList, err := svc.GetFollowing(ctx, "u1", 10, "")
+	followingList, err := svc.GetFollowing(ctx, u1ID, 10, "")
 	if err != nil || len(followingList.Data) == 0 {
 		t.Fatalf("failed GetFollowing: %v", err)
 	}
-	_, err = svc.GetFollowing(ctx, "nonexistent", 10, "")
+	_, err = svc.GetFollowing(ctx, nonExistentID, 10, "")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on GetFollowing for nonexistent user, got %v", err)
 	}
-	_, err = svc.GetFollowing(ctx, "u1", 10, "invalid-cursor-encoding")
+	_, err = svc.GetFollowing(ctx, u1ID, 10, "invalid-cursor-encoding")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on invalid cursor, got %v", err)
 	}
@@ -1345,11 +1374,17 @@ func TestPostService_FullSuite(t *testing.T) {
 	repo := newFakePostRepo()
 	svc := services.NewPostService(repo, "https://storage.local")
 
-	u := &models.UserDetail{ID: "author-1", Username: "auth", DisplayName: "Auth User"}
-	repo.users["author-1"] = u
+	authorID := uuid.NewString()
+	asset1 := uuid.NewString()
+	asset2 := uuid.NewString()
+	nonExistentID := uuid.NewString()
+	likerID := uuid.NewString()
+
+	u := &models.UserDetail{ID: authorID, Username: "auth", DisplayName: "Auth User"}
+	repo.users[authorID] = u
 
 	// CreatePost
-	p, err := svc.CreatePost(ctx, "author-1", "Valid post body", []string{"asset-1", "asset-2"})
+	p, err := svc.CreatePost(ctx, authorID, "Valid post body", []string{asset1, asset2})
 	if err != nil || p == nil {
 		t.Fatalf("failed CreatePost: %v", err)
 	}
@@ -1359,64 +1394,64 @@ func TestPostService_FullSuite(t *testing.T) {
 	if err != nil || gp.ID != p.ID {
 		t.Fatalf("failed GetPost: %v", err)
 	}
-	_, err = svc.GetPost(ctx, "nonexistent", nil)
+	_, err = svc.GetPost(ctx, nonExistentID, nil)
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on nonexistent GetPost, got %v", err)
 	}
 
 	// UpdatePost
-	_, err = svc.UpdatePost(ctx, p.ID, "author-1", "user", "")
+	_, err = svc.UpdatePost(ctx, p.ID, authorID, "user", "")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on empty post update, got %v", err)
 	}
-	_, err = svc.UpdatePost(ctx, p.ID, "author-1", "user", strings.Repeat("x", 2001))
+	_, err = svc.UpdatePost(ctx, p.ID, authorID, "user", strings.Repeat("x", 2001))
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on post update > 2000 chars, got %v", err)
 	}
-	up, err := svc.UpdatePost(ctx, p.ID, "author-1", "user", "Valid update")
+	up, err := svc.UpdatePost(ctx, p.ID, authorID, "user", "Valid update")
 	if err != nil || up.Body != "Valid update" {
 		t.Fatalf("failed valid UpdatePost: %v", err)
 	}
 
 	// LikePost & UnlikePost
-	liked, err := svc.LikePost(ctx, "liker-1", p.ID)
+	liked, err := svc.LikePost(ctx, likerID, p.ID)
 	if err != nil || !liked {
 		t.Fatalf("failed LikePost: %v", err)
 	}
-	_, err = svc.LikePost(ctx, "liker-1", "nonexistent")
+	_, err = svc.LikePost(ctx, likerID, nonExistentID)
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on liking nonexistent post, got %v", err)
 	}
 
-	unliked, err := svc.UnlikePost(ctx, "liker-1", p.ID)
+	unliked, err := svc.UnlikePost(ctx, likerID, p.ID)
 	if err != nil || unliked {
 		t.Fatalf("failed UnlikePost: %v", err)
 	}
-	_, err = svc.UnlikePost(ctx, "liker-1", "nonexistent")
+	_, err = svc.UnlikePost(ctx, likerID, nonExistentID)
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on unliking nonexistent post, got %v", err)
 	}
 
 	// GetFeed
-	feed, err := svc.GetFeed(ctx, "author-1", 10, "")
+	feed, err := svc.GetFeed(ctx, authorID, 10, "")
 	if err != nil || len(feed.Data) == 0 {
 		t.Fatalf("failed GetFeed: %v", err)
 	}
-	_, err = svc.GetFeed(ctx, "author-1", 10, "bad-cursor")
+	_, err = svc.GetFeed(ctx, authorID, 10, "bad-cursor")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on bad feed cursor, got %v", err)
 	}
 
 	// GetUserPosts
-	uPosts, err := svc.GetUserPosts(ctx, "author-1", nil, 10, "")
+	uPosts, err := svc.GetUserPosts(ctx, authorID, nil, 10, "")
 	if err != nil || len(uPosts.Data) == 0 {
 		t.Fatalf("failed GetUserPosts: %v", err)
 	}
-	_, err = svc.GetUserPosts(ctx, "nonexistent", nil, 10, "")
+	_, err = svc.GetUserPosts(ctx, nonExistentID, nil, 10, "")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on GetUserPosts for nonexistent user, got %v", err)
 	}
-	_, err = svc.GetUserPosts(ctx, "author-1", nil, 10, "bad-cursor")
+	_, err = svc.GetUserPosts(ctx, authorID, nil, 10, "bad-cursor")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on bad user posts cursor, got %v", err)
 	}
@@ -1427,60 +1462,66 @@ func TestCommentService_FullSuite(t *testing.T) {
 	repo := newFakeCommentRepo()
 	svc := services.NewCommentService(repo, "https://storage.local")
 
+	postID := uuid.NewString()
+	authorID := uuid.NewString()
+	userID := uuid.NewString()
+	nonExistentPostID := uuid.NewString()
+	nonExistentCommentID := uuid.NewString()
+
 	post := &models.PostDetail{
 		Post: models.Post{
-			ID:        "post-123",
-			AuthorID:  "author-1",
+			ID:        postID,
+			AuthorID:  authorID,
 			Body:      "Post for comments",
 			CreatedAt: time.Now(),
 		},
 	}
-	repo.posts["post-123"] = post
+	repo.posts[postID] = post
 
 	// CreateComment
-	_, err := svc.CreateComment(ctx, "user-1", "post-123", "")
+	_, err := svc.CreateComment(ctx, userID, postID, "")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on empty comment body, got %v", err)
 	}
-	_, err = svc.CreateComment(ctx, "user-1", "post-123", strings.Repeat("c", 1001))
+	_, err = svc.CreateComment(ctx, userID, postID, strings.Repeat("c", 1001))
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on comment body > 1000, got %v", err)
 	}
-	_, err = svc.CreateComment(ctx, "user-1", "nonexistent-post", "Valid comment")
+	_, err = svc.CreateComment(ctx, userID, nonExistentPostID, "Valid comment")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on nonexistent post comment, got %v", err)
 	}
 
-	c, err := svc.CreateComment(ctx, "user-1", "post-123", "Valid comment")
+	c, err := svc.CreateComment(ctx, userID, postID, "Valid comment")
 	if err != nil || c.Body != "Valid comment" {
 		t.Fatalf("failed CreateComment: %v", err)
 	}
 
 	// GetComments
-	cList, err := svc.GetComments(ctx, "post-123", 10, "")
+	cList, err := svc.GetComments(ctx, postID, 10, "")
 	if err != nil || len(cList.Data) == 0 {
 		t.Fatalf("failed GetComments: %v", err)
 	}
-	_, err = svc.GetComments(ctx, "nonexistent-post", 10, "")
+	_, err = svc.GetComments(ctx, nonExistentPostID, 10, "")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on GetComments nonexistent post, got %v", err)
 	}
-	_, err = svc.GetComments(ctx, "post-123", 10, "bad-cursor")
+	_, err = svc.GetComments(ctx, postID, 10, "bad-cursor")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on bad comment cursor, got %v", err)
 	}
 
 	// DeleteComment
-	err = svc.DeleteComment(ctx, "nonexistent-comment", "user-1", "user")
+	err = svc.DeleteComment(ctx, nonExistentCommentID, userID, "user")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on deleting nonexistent comment, got %v", err)
 	}
-	err = svc.DeleteComment(ctx, c.ID, "user-1", "user")
+	err = svc.DeleteComment(ctx, c.ID, userID, "user")
 	if err != nil {
 		t.Fatalf("failed DeleteComment: %v", err)
 	}
 	// Soft deleted comment should now return ErrNotFound
-	err = svc.DeleteComment(ctx, c.ID, "user-1", "user")
+	err = svc.DeleteComment(ctx, c.ID, userID, "user")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on already deleted comment, got %v", err)
 	}
@@ -1492,25 +1533,29 @@ func TestAssetService_FullSuite(t *testing.T) {
 	store := newMockStorageClient()
 	svc := services.NewAssetService(repo, store, "media", "https://storage.local")
 
+	userID := uuid.NewString()
+	nonExistentAssetID := uuid.NewString()
+	expiredAssetID := uuid.NewString()
+
 	// CreateAsset (valid cases)
-	id1, url1, err := svc.CreateAsset(ctx, "user-1", "post_image", "image/jpeg", 2048)
+	id1, url1, err := svc.CreateAsset(ctx, userID, "post_image", "image/jpeg", 2048)
 	if err != nil || id1 == "" || url1 == "" {
 		t.Fatalf("failed CreateAsset jpeg: %v", err)
 	}
-	id2, url2, err := svc.CreateAsset(ctx, "user-1", "avatar", "image/webp", 4096)
+	id2, url2, err := svc.CreateAsset(ctx, userID, "avatar", "image/webp", 4096)
 	if err != nil || id2 == "" || url2 == "" {
 		t.Fatalf("failed CreateAsset webp: %v", err)
 	}
 
 	// CompleteAsset
 	// Nonexistent asset
-	_, err = svc.CompleteAsset(ctx, "nonexistent-asset", "user-1", "user")
+	_, err = svc.CompleteAsset(ctx, nonExistentAssetID, userID, "user")
 	if !errors.Is(err, services.ErrNotFound) {
 		t.Errorf("expected ErrNotFound completing nonexistent asset, got %v", err)
 	}
 
 	// Storage object missing
-	_, err = svc.CompleteAsset(ctx, id1, "user-1", "user")
+	_, err = svc.CompleteAsset(ctx, id1, userID, "user")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation when storage object missing, got %v", err)
 	}
@@ -1518,26 +1563,26 @@ func TestAssetService_FullSuite(t *testing.T) {
 	// Size mismatch in storage
 	asset1, _ := repo.GetAssetByID(ctx, id1)
 	store.objects[asset1.StorageKey] = 1000 // expected 2048
-	_, err = svc.CompleteAsset(ctx, id1, "user-1", "user")
+	_, err = svc.CompleteAsset(ctx, id1, userID, "user")
 	if !errors.Is(err, services.ErrValidation) {
 		t.Errorf("expected ErrValidation on size mismatch, got %v", err)
 	}
 
 	// Valid completion
 	store.objects[asset1.StorageKey] = 2048
-	publicURL, err := svc.CompleteAsset(ctx, id1, "user-1", "user")
+	publicURL, err := svc.CompleteAsset(ctx, id1, userID, "user")
 	if err != nil || publicURL == "" {
 		t.Fatalf("failed valid CompleteAsset: %v", err)
 	}
 
 	// Already ready -> ErrAlreadyReady
-	_, err = svc.CompleteAsset(ctx, id1, "user-1", "user")
+	_, err = svc.CompleteAsset(ctx, id1, userID, "user")
 	if !errors.Is(err, services.ErrAlreadyReady) {
 		t.Errorf("expected ErrAlreadyReady on already completed asset, got %v", err)
 	}
 
 	// CleanupExpiredAssets
-	expiredAsset, _ := repo.CreateAsset(ctx, "expired-1", "user-1", "post_image", "media", "u/user-1/expired.png", "image/png", 500)
+	expiredAsset, _ := repo.CreateAsset(ctx, expiredAssetID, userID, "post_image", "media", fmt.Sprintf("u/%s/expired.png", userID), "image/png", 500)
 	expiredAsset.UploadExpiresAt = time.Now().Add(-2 * time.Hour)
 	store.objects[expiredAsset.StorageKey] = 500
 
@@ -1651,23 +1696,24 @@ func TestServices_TargetedBranchCoverage(t *testing.T) {
 	t.Run("PostService_TriggerError_And_Pagination", func(t *testing.T) {
 		repo := newFakePostRepo()
 		svc := services.NewPostService(repo, "https://storage.local")
+		authorID := uuid.NewString()
 
 		// Add 5 posts to test hasMore = true and nextCursor calculation
 		for i := 0; i < 5; i++ {
-			p, _ := repo.CreatePost(ctx, "author-1", "Body", nil)
+			p, _ := repo.CreatePost(ctx, authorID, "Body", nil)
 			p.AuthorAvatarStorageKey = new(string)
-			*p.AuthorAvatarStorageKey = "u/author-1/avatar.png"
+			*p.AuthorAvatarStorageKey = fmt.Sprintf("u/%s/avatar.png", authorID)
 		}
 
 		// Feed with limit 2 (hasMore = true)
-		feed, err := svc.GetFeed(ctx, "author-1", 2, "")
+		feed, err := svc.GetFeed(ctx, authorID, 2, "")
 		if err != nil || !feed.Pagination.HasMore || feed.Pagination.NextCursor == nil {
 			t.Fatalf("expected hasMore and nextCursor on feed, got %+v", feed)
 		}
 
 		// UserPosts with limit 2 (hasMore = true)
-		repo.users["author-1"] = &models.UserDetail{ID: "author-1"}
-		uPosts, err := svc.GetUserPosts(ctx, "author-1", nil, 2, "")
+		repo.users[authorID] = &models.UserDetail{ID: authorID}
+		uPosts, err := svc.GetUserPosts(ctx, authorID, nil, 2, "")
 		if err != nil || !uPosts.Pagination.HasMore || uPosts.Pagination.NextCursor == nil {
 			t.Fatalf("expected hasMore and nextCursor on user posts, got %+v", uPosts)
 		}
@@ -1677,16 +1723,18 @@ func TestServices_TargetedBranchCoverage(t *testing.T) {
 	t.Run("CommentService_Pagination_And_Avatar", func(t *testing.T) {
 		repo := newFakeCommentRepo()
 		svc := services.NewCommentService(repo, "https://storage.local")
-		repo.posts["post-1"] = &models.PostDetail{Post: models.Post{ID: "post-1"}}
+		postID := uuid.NewString()
+		authorID := uuid.NewString()
+		repo.posts[postID] = &models.PostDetail{Post: models.Post{ID: postID}}
 
 		for i := 0; i < 4; i++ {
-			c, _ := repo.CreateComment(ctx, "post-1", "author-1", "Body")
+			c, _ := repo.CreateComment(ctx, postID, authorID, "Body")
 			c.AuthorAvatarStorageKey = new(string)
-			*c.AuthorAvatarStorageKey = "u/author-1/avatar.png"
+			*c.AuthorAvatarStorageKey = fmt.Sprintf("u/%s/avatar.png", authorID)
 		}
 
 		// Limit 2 (hasMore = true)
-		cList, err := svc.GetComments(ctx, "post-1", 2, "")
+		cList, err := svc.GetComments(ctx, postID, 2, "")
 		if err != nil || !cList.Pagination.HasMore || cList.Pagination.NextCursor == nil {
 			t.Fatalf("expected hasMore and nextCursor on comments, got %+v", cList)
 		}
@@ -1697,21 +1745,26 @@ func TestServices_TargetedBranchCoverage(t *testing.T) {
 		repo := newFakeUserRepo()
 		svc := services.NewUserService(repo, "https://storage.local")
 
-		repo.users["target"] = &models.UserDetail{ID: "target"}
+		targetID := uuid.NewString()
+		repo.users[targetID] = &models.UserDetail{ID: targetID}
+		var firstFollower string
 		for i := 0; i < 4; i++ {
-			uid := fmt.Sprintf("follower-%d", i)
-			repo.users[uid] = &models.UserDetail{ID: uid, Username: uid}
-			_, _ = repo.Follow(ctx, uid, "target")
+			uid := uuid.NewString()
+			if i == 0 {
+				firstFollower = uid
+			}
+			repo.users[uid] = &models.UserDetail{ID: uid, Username: fmt.Sprintf("follower%d", i)}
+			_, _ = repo.Follow(ctx, uid, targetID)
 		}
 
 		// Limit 2 followers (hasMore = true)
-		fList, err := svc.GetFollowers(ctx, "target", 2, "")
+		fList, err := svc.GetFollowers(ctx, targetID, 2, "")
 		if err != nil || !fList.Pagination.HasMore || fList.Pagination.NextCursor == nil {
 			t.Fatalf("expected hasMore and nextCursor on followers, got %+v", fList)
 		}
 
 		// Limit 2 following (hasMore = true)
-		followingList, err := svc.GetFollowing(ctx, "follower-0", 1, "")
+		followingList, err := svc.GetFollowing(ctx, firstFollower, 1, "")
 		if err != nil || followingList == nil {
 			t.Fatalf("failed GetFollowing: %v", err)
 		}

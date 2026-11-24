@@ -195,12 +195,12 @@ type LikeStateResponse struct {
 
 // CommentResponse is the public representation of a comment.
 type CommentResponse struct {
-	ID       string              `json:"id"`
-	PostID   string              `json:"postId"`
-	AuthorID string              `json:"authorId"`
-	Author   *PublicUserResponse `json:"author,omitempty"`
-	Body     string              `json:"body"`
-	CreatedAt string             `json:"createdAt"`
+	ID        string              `json:"id"`
+	PostID    string              `json:"postId"`
+	AuthorID  string              `json:"authorId"`
+	Author    *PublicUserResponse `json:"author,omitempty"`
+	Body      string              `json:"body"`
+	CreatedAt string              `json:"createdAt"`
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +231,7 @@ type AssetResponse struct {
 
 // CreateAssetResponse is returned when a presigned upload URL is issued.
 type CreateAssetResponse struct {
-	AssetID        string `json:"assetId"`
+	AssetID         string `json:"assetId"`
 	PresignedPutURL string `json:"presignedPutUrl"`
 }
 
@@ -281,7 +281,7 @@ type TokenResponse struct {
 // UserListResponse wraps a paginated list of public user profiles.
 type UserListResponse struct {
 	Data       []PublicUserResponse `json:"data"`
-	Pagination PaginationMeta      `json:"pagination"`
+	Pagination PaginationMeta       `json:"pagination"`
 }
 
 // PostListResponse wraps a paginated list of posts.

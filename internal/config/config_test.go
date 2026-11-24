@@ -49,7 +49,7 @@ func TestConfig_Load_ShortOTPHMACKey(t *testing.T) {
 
 	os.Setenv("DATABASE_URL", "postgres://localhost:5432/test")
 	os.Setenv("JWT_SECRET", "12345678901234567890123456789012") // 32 bytes
-	os.Setenv("OTP_HMAC_KEY", "short")                           // < 32 bytes
+	os.Setenv("OTP_HMAC_KEY", "short")                          // < 32 bytes
 
 	_, err := config.Load()
 	if err == nil {

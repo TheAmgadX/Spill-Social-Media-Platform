@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/TheAmgadX/Spill-Social-Media-Platform/internal/models"
@@ -83,17 +82,12 @@ func (s *PostService) ToPostResponse(p *models.PostDetail) views.PostResponse {
 }
 
 func (s *PostService) CreatePost(ctx context.Context, authorID, body string, assetIDs []string) (*views.PostResponse, error) {
-	// Rule 4: post has body text or at least one image
-	trimmed := strings.TrimSpace(body)
-	if trimmed == "" && len(assetIDs) == 0 {
-		return nil, fmt.Errorf("%w: post must have body text or at least one image", ErrValidation)
+	cleanAuthorID, cleanBody, cleanAssetIDs, err := ValidateCreatePost(authorID, body, assetIDs)
+	if err != nil {
+		return nil, err
 	}
 
-	if len([]rune(body)) > 2000 {
-		return nil, fmt.Errorf("%w: post body must not exceed 2000 characters", ErrValidation)
-	}
-
-	post, err := s.repo.CreatePost(ctx, authorID, body, assetIDs)
+	post, err := s.repo.CreatePost(ctx, cleanAuthorID, cleanBody, cleanAssetIDs)
 	if err != nil {
 		var trgErr *models.TriggerError
 		if errors.As(err, &trgErr) {
@@ -107,7 +101,12 @@ func (s *PostService) CreatePost(ctx context.Context, authorID, body string, ass
 }
 
 func (s *PostService) GetPost(ctx context.Context, id string, currentUserID *string) (*views.PostResponse, error) {
-	post, err := s.repo.GetPostByID(ctx, id, currentUserID)
+	cleanID, cleanUserID, err := ValidateGetPost(id, currentUserID)
+	if err != nil {
+		return nil, err
+	}
+
+	post, err := s.repo.GetPostByID(ctx, cleanID, cleanUserID)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
@@ -120,8 +119,12 @@ func (s *PostService) GetPost(ctx context.Context, id string, currentUserID *str
 }
 
 func (s *PostService) UpdatePost(ctx context.Context, id, currentUserID, userRole, body string) (*views.PostResponse, error) {
-	// Fetch post to check ownership (Rule 1: author or admin)
-	existing, err := s.repo.GetPostByID(ctx, id, nil)
+	cleanID, cleanUserID, cleanRole, cleanBody, err := ValidateUpdatePost(id, currentUserID, userRole, body)
+	if err != nil {
+		return nil, err
+	}
+
+	existing, err := s.repo.GetPostByID(ctx, cleanID, nil)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
@@ -129,25 +132,24 @@ func (s *PostService) UpdatePost(ctx context.Context, id, currentUserID, userRol
 		return nil, err
 	}
 
-	if existing.AuthorID != currentUserID && userRole != "admin" {
+	if existing.AuthorID != cleanUserID && cleanRole != "admin" {
 		return nil, ErrForbidden
 	}
 
-	l := len([]rune(body))
-	if l < 1 || l > 2000 {
-		return nil, fmt.Errorf("%w: post body must be between 1 and 2000 characters", ErrValidation)
-	}
-
-	if _, err := s.repo.UpdatePost(ctx, id, body); err != nil {
+	if _, err := s.repo.UpdatePost(ctx, cleanID, cleanBody); err != nil {
 		return nil, err
 	}
 
-	return s.GetPost(ctx, id, &currentUserID)
+	return s.GetPost(ctx, cleanID, &cleanUserID)
 }
 
 func (s *PostService) DeletePost(ctx context.Context, id, currentUserID, userRole string) error {
-	// Fetch post to check ownership (Rule 1: author or admin)
-	existing, err := s.repo.GetPostByID(ctx, id, nil)
+	cleanID, cleanUserID, cleanRole, err := ValidateDeletePost(id, currentUserID, userRole)
+	if err != nil {
+		return err
+	}
+
+	existing, err := s.repo.GetPostByID(ctx, cleanID, nil)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return ErrNotFound
@@ -155,33 +157,27 @@ func (s *PostService) DeletePost(ctx context.Context, id, currentUserID, userRol
 		return err
 	}
 
-	if existing.AuthorID != currentUserID && userRole != "admin" {
+	if existing.AuthorID != cleanUserID && cleanRole != "admin" {
 		return ErrForbidden
 	}
 
-	return s.repo.SoftDeletePost(ctx, id)
+	return s.repo.SoftDeletePost(ctx, cleanID)
 }
 
 func (s *PostService) GetFeed(ctx context.Context, currentUserID string, limit int, cursorStr string) (*views.PostListResponse, error) {
-	var cursorTime *time.Time
-	var cursorID string
-	if cursorStr != "" {
-		t, id, err := views.DecodeCursor(cursorStr)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid cursor", ErrValidation)
-		}
-		cursorTime = &t
-		cursorID = id
-	}
-
-	posts, err := s.repo.GetFeed(ctx, currentUserID, limit+1, cursorTime, cursorID)
+	cleanUserID, cleanLimit, cursorTime, cursorID, err := ValidateGetFeed(currentUserID, limit, cursorStr)
 	if err != nil {
 		return nil, err
 	}
 
-	hasMore := len(posts) > limit
+	posts, err := s.repo.GetFeed(ctx, cleanUserID, cleanLimit+1, cursorTime, cursorID)
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := len(posts) > cleanLimit
 	if hasMore {
-		posts = posts[:limit]
+		posts = posts[:cleanLimit]
 	}
 
 	var data []views.PostResponse
@@ -200,40 +196,34 @@ func (s *PostService) GetFeed(ctx context.Context, currentUserID string, limit i
 		Data: data,
 		Pagination: views.PaginationMeta{
 			NextCursor: nextCursor,
-			Limit:      limit,
+			Limit:      cleanLimit,
 			HasMore:    hasMore,
 		},
 	}, nil
 }
 
 func (s *PostService) GetUserPosts(ctx context.Context, targetUserID string, currentUserID *string, limit int, cursorStr string) (*views.PostListResponse, error) {
+	cleanTargetID, cleanUserID, cleanLimit, cursorTime, cursorID, err := ValidateGetUserPosts(targetUserID, currentUserID, limit, cursorStr)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verify user exists
-	if _, err := s.repo.GetUserByID(ctx, targetUserID); err != nil {
+	if _, err := s.repo.GetUserByID(ctx, cleanTargetID); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 
-	var cursorTime *time.Time
-	var cursorID string
-	if cursorStr != "" {
-		t, id, err := views.DecodeCursor(cursorStr)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid cursor", ErrValidation)
-		}
-		cursorTime = &t
-		cursorID = id
-	}
-
-	posts, err := s.repo.GetUserPosts(ctx, targetUserID, currentUserID, limit+1, cursorTime, cursorID)
+	posts, err := s.repo.GetUserPosts(ctx, cleanTargetID, cleanUserID, cleanLimit+1, cursorTime, cursorID)
 	if err != nil {
 		return nil, err
 	}
 
-	hasMore := len(posts) > limit
+	hasMore := len(posts) > cleanLimit
 	if hasMore {
-		posts = posts[:limit]
+		posts = posts[:cleanLimit]
 	}
 
 	var data []views.PostResponse
@@ -252,22 +242,27 @@ func (s *PostService) GetUserPosts(ctx context.Context, targetUserID string, cur
 		Data: data,
 		Pagination: views.PaginationMeta{
 			NextCursor: nextCursor,
-			Limit:      limit,
+			Limit:      cleanLimit,
 			HasMore:    hasMore,
 		},
 	}, nil
 }
 
 func (s *PostService) LikePost(ctx context.Context, currentUserID, postID string) (bool, error) {
+	cleanUserID, cleanPostID, err := ValidateLikePost(currentUserID, postID)
+	if err != nil {
+		return false, err
+	}
+
 	// Verify post exists and not soft-deleted
-	if _, err := s.repo.GetPostByID(ctx, postID, nil); err != nil {
+	if _, err := s.repo.GetPostByID(ctx, cleanPostID, nil); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return false, ErrNotFound
 		}
 		return false, err
 	}
 
-	_, err := s.repo.LikePost(ctx, currentUserID, postID)
+	_, err = s.repo.LikePost(ctx, cleanUserID, cleanPostID)
 	if err != nil {
 		return false, err
 	}
@@ -276,15 +271,20 @@ func (s *PostService) LikePost(ctx context.Context, currentUserID, postID string
 }
 
 func (s *PostService) UnlikePost(ctx context.Context, currentUserID, postID string) (bool, error) {
+	cleanUserID, cleanPostID, err := ValidateUnlikePost(currentUserID, postID)
+	if err != nil {
+		return false, err
+	}
+
 	// Verify post exists and not soft-deleted
-	if _, err := s.repo.GetPostByID(ctx, postID, nil); err != nil {
+	if _, err := s.repo.GetPostByID(ctx, cleanPostID, nil); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return false, ErrNotFound
 		}
 		return false, err
 	}
 
-	_, err := s.repo.UnlikePost(ctx, currentUserID, postID)
+	_, err = s.repo.UnlikePost(ctx, cleanUserID, cleanPostID)
 	if err != nil {
 		return false, err
 	}
@@ -293,19 +293,20 @@ func (s *PostService) UnlikePost(ctx context.Context, currentUserID, postID stri
 }
 
 func (s *PostService) SharePost(ctx context.Context, currentUserID, postID string, quote *string) (*views.ShareResponse, error) {
-	if quote != nil && len([]rune(*quote)) > 500 {
-		return nil, fmt.Errorf("%w: quote must not exceed 500 characters", ErrValidation)
+	cleanUserID, cleanPostID, cleanQuote, err := ValidateSharePost(currentUserID, postID, quote)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify post exists and not soft-deleted
-	if _, err := s.repo.GetPostByID(ctx, postID, nil); err != nil {
+	if _, err := s.repo.GetPostByID(ctx, cleanPostID, nil); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 
-	sh, err := s.repo.CreateShare(ctx, currentUserID, postID, quote)
+	sh, err := s.repo.CreateShare(ctx, cleanUserID, cleanPostID, cleanQuote)
 	if err != nil {
 		return nil, err
 	}

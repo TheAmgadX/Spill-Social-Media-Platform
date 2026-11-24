@@ -37,39 +37,26 @@ func NewAssetService(repo AssetRepository, storageClient storage.StorageClient, 
 }
 
 func (s *AssetService) CreateAsset(ctx context.Context, ownerID, kind, mimeType string, sizeBytes int64) (string, string, error) {
-	// Validate size against schema limits
-	if sizeBytes > 5242880 {
-		return "", "", fmt.Errorf("%w: asset size must not exceed 5 242 880 bytes (5 MB)", ErrPayloadTooLarge)
-	}
-	if sizeBytes < 1 {
-		return "", "", fmt.Errorf("%w: asset size must be at least 1 byte", ErrValidation)
+	cleanOwnerID, cleanKind, cleanMime, err := ValidateCreateAsset(ownerID, kind, mimeType, sizeBytes)
+	if err != nil {
+		return "", "", err
 	}
 
-	// Validate MIME type
 	var ext string
-	switch mimeType {
+	switch cleanMime {
 	case "image/jpeg":
 		ext = "jpg"
 	case "image/png":
 		ext = "png"
 	case "image/webp":
 		ext = "webp"
-	default:
-		return "", "", fmt.Errorf("%w: unsupported mime type %s (allowed: image/jpeg, image/png, image/webp)", ErrValidation, mimeType)
-	}
-
-	if kind == "" {
-		kind = "post_image"
-	}
-	if kind != "post_image" && kind != "avatar" {
-		return "", "", fmt.Errorf("%w: invalid kind %s", ErrValidation, kind)
 	}
 
 	assetID := uuid.NewString()
-	storageKey := fmt.Sprintf("u/%s/%s.%s", ownerID, assetID, ext)
+	storageKey := fmt.Sprintf("u/%s/%s.%s", cleanOwnerID, assetID, ext)
 
 	// Insert pending row into database
-	_, err := s.repo.CreateAsset(ctx, assetID, ownerID, kind, s.storageBucket, storageKey, mimeType, sizeBytes)
+	_, err = s.repo.CreateAsset(ctx, assetID, cleanOwnerID, cleanKind, s.storageBucket, storageKey, cleanMime, sizeBytes)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to save asset record: %w", err)
 	}
@@ -84,7 +71,12 @@ func (s *AssetService) CreateAsset(ctx context.Context, ownerID, kind, mimeType 
 }
 
 func (s *AssetService) CompleteAsset(ctx context.Context, assetID, currentUserID, userRole string) (string, error) {
-	asset, err := s.repo.GetAssetByID(ctx, assetID)
+	cleanAssetID, cleanUserID, cleanRole, err := ValidateCompleteAsset(assetID, currentUserID, userRole)
+	if err != nil {
+		return "", err
+	}
+
+	asset, err := s.repo.GetAssetByID(ctx, cleanAssetID)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return "", ErrNotFound
@@ -93,7 +85,7 @@ func (s *AssetService) CompleteAsset(ctx context.Context, assetID, currentUserID
 	}
 
 	// Ownership check
-	if asset.OwnerID != currentUserID && userRole != "admin" {
+	if asset.OwnerID != cleanUserID && cleanRole != "admin" {
 		return "", ErrForbidden
 	}
 
@@ -113,7 +105,7 @@ func (s *AssetService) CompleteAsset(ctx context.Context, assetID, currentUserID
 	}
 
 	// Set status = 'ready' and completed_at = now()
-	completed, err := s.repo.CompleteAsset(ctx, assetID)
+	completed, err := s.repo.CompleteAsset(ctx, cleanAssetID)
 	if err != nil {
 		return "", fmt.Errorf("failed to mark asset ready: %w", err)
 	}
