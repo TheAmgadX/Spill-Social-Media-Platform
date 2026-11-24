@@ -41,7 +41,12 @@ func (s *UserService) AssetURL(storageKey *string) *string {
 }
 
 func (s *UserService) GetProfile(ctx context.Context, username string) (*views.PublicUserResponse, error) {
-	u, err := s.repo.GetUserByUsername(ctx, username)
+	cleanUsername, err := ValidateGetProfile(username)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := s.repo.GetUserByUsername(ctx, cleanUsername)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
@@ -63,7 +68,12 @@ func (s *UserService) GetProfile(ctx context.Context, username string) (*views.P
 }
 
 func (s *UserService) GetMe(ctx context.Context, userID string) (*views.PrivateUserResponse, error) {
-	u, err := s.repo.GetUserByID(ctx, userID)
+	cleanUserID, err := ValidateGetMe(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := s.repo.GetUserByID(ctx, cleanUserID)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
@@ -87,14 +97,12 @@ func (s *UserService) GetMe(ctx context.Context, userID string) (*views.PrivateU
 }
 
 func (s *UserService) UpdateMe(ctx context.Context, userID string, displayName *string, avatarAssetID *string, clearAvatar bool) (*views.PrivateUserResponse, error) {
-	if displayName != nil {
-		l := len([]rune(*displayName))
-		if l < 1 || l > 50 {
-			return nil, fmt.Errorf("%w: displayName must be between 1 and 50 characters", ErrValidation)
-		}
+	cleanUserID, cleanDisplayName, cleanAvatarAssetID, cleanClearAvatar, err := ValidateUpdateMe(userID, displayName, avatarAssetID, clearAvatar)
+	if err != nil {
+		return nil, err
 	}
 
-	u, err := s.repo.UpdateUserProfile(ctx, userID, displayName, avatarAssetID, clearAvatar)
+	u, err := s.repo.UpdateUserProfile(ctx, cleanUserID, cleanDisplayName, cleanAvatarAssetID, cleanClearAvatar)
 	if err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
@@ -118,19 +126,20 @@ func (s *UserService) UpdateMe(ctx context.Context, userID string, displayName *
 }
 
 func (s *UserService) FollowUser(ctx context.Context, currentUserID, targetUserID string) (bool, error) {
-	if currentUserID == targetUserID {
-		return false, ErrSelfFollow
+	cleanUserID, cleanTargetID, err := ValidateFollowUser(currentUserID, targetUserID)
+	if err != nil {
+		return false, err
 	}
 
 	// Verify target user exists
-	if _, err := s.repo.GetUserByID(ctx, targetUserID); err != nil {
+	if _, err := s.repo.GetUserByID(ctx, cleanTargetID); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return false, ErrNotFound
 		}
 		return false, err
 	}
 
-	_, err := s.repo.Follow(ctx, currentUserID, targetUserID)
+	_, err = s.repo.Follow(ctx, cleanUserID, cleanTargetID)
 	if err != nil {
 		return false, err
 	}
@@ -139,15 +148,20 @@ func (s *UserService) FollowUser(ctx context.Context, currentUserID, targetUserI
 }
 
 func (s *UserService) UnfollowUser(ctx context.Context, currentUserID, targetUserID string) (bool, error) {
+	cleanUserID, cleanTargetID, err := ValidateUnfollowUser(currentUserID, targetUserID)
+	if err != nil {
+		return false, err
+	}
+
 	// Verify target user exists
-	if _, err := s.repo.GetUserByID(ctx, targetUserID); err != nil {
+	if _, err := s.repo.GetUserByID(ctx, cleanTargetID); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return false, ErrNotFound
 		}
 		return false, err
 	}
 
-	_, err := s.repo.Unfollow(ctx, currentUserID, targetUserID)
+	_, err = s.repo.Unfollow(ctx, cleanUserID, cleanTargetID)
 	if err != nil {
 		return false, err
 	}
@@ -156,34 +170,28 @@ func (s *UserService) UnfollowUser(ctx context.Context, currentUserID, targetUse
 }
 
 func (s *UserService) GetFollowers(ctx context.Context, targetUserID string, limit int, cursorStr string) (*views.UserListResponse, error) {
+	cleanTargetID, cleanLimit, cursorTime, cursorID, err := ValidateGetFollowers(targetUserID, limit, cursorStr)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verify user exists
-	if _, err := s.repo.GetUserByID(ctx, targetUserID); err != nil {
+	if _, err := s.repo.GetUserByID(ctx, cleanTargetID); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 
-	var cursorTime *time.Time
-	var cursorID string
-	if cursorStr != "" {
-		t, id, err := views.DecodeCursor(cursorStr)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid cursor", ErrValidation)
-		}
-		cursorTime = &t
-		cursorID = id
-	}
-
 	// Fetch limit + 1 to detect hasMore
-	users, err := s.repo.GetFollowers(ctx, targetUserID, limit+1, cursorTime, cursorID)
+	users, err := s.repo.GetFollowers(ctx, cleanTargetID, cleanLimit+1, cursorTime, cursorID)
 	if err != nil {
 		return nil, err
 	}
 
-	hasMore := len(users) > limit
+	hasMore := len(users) > cleanLimit
 	if hasMore {
-		users = users[:limit]
+		users = users[:cleanLimit]
 	}
 
 	var data []views.PublicUserResponse
@@ -213,40 +221,34 @@ func (s *UserService) GetFollowers(ctx context.Context, targetUserID string, lim
 		Data: data,
 		Pagination: views.PaginationMeta{
 			NextCursor: nextCursor,
-			Limit:      limit,
+			Limit:      cleanLimit,
 			HasMore:    hasMore,
 		},
 	}, nil
 }
 
 func (s *UserService) GetFollowing(ctx context.Context, targetUserID string, limit int, cursorStr string) (*views.UserListResponse, error) {
+	cleanTargetID, cleanLimit, cursorTime, cursorID, err := ValidateGetFollowing(targetUserID, limit, cursorStr)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verify user exists
-	if _, err := s.repo.GetUserByID(ctx, targetUserID); err != nil {
+	if _, err := s.repo.GetUserByID(ctx, cleanTargetID); err != nil {
 		if errors.Is(err, models.ErrNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 
-	var cursorTime *time.Time
-	var cursorID string
-	if cursorStr != "" {
-		t, id, err := views.DecodeCursor(cursorStr)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid cursor", ErrValidation)
-		}
-		cursorTime = &t
-		cursorID = id
-	}
-
-	users, err := s.repo.GetFollowing(ctx, targetUserID, limit+1, cursorTime, cursorID)
+	users, err := s.repo.GetFollowing(ctx, cleanTargetID, cleanLimit+1, cursorTime, cursorID)
 	if err != nil {
 		return nil, err
 	}
 
-	hasMore := len(users) > limit
+	hasMore := len(users) > cleanLimit
 	if hasMore {
-		users = users[:limit]
+		users = users[:cleanLimit]
 	}
 
 	var data []views.PublicUserResponse
@@ -276,7 +278,7 @@ func (s *UserService) GetFollowing(ctx context.Context, targetUserID string, lim
 		Data: data,
 		Pagination: views.PaginationMeta{
 			NextCursor: nextCursor,
-			Limit:      limit,
+			Limit:      cleanLimit,
 			HasMore:    hasMore,
 		},
 	}, nil

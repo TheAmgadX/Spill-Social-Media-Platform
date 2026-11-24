@@ -10,21 +10,21 @@ import (
 )
 
 type Asset struct {
-	ID                string
-	OwnerID           string
-	Kind              string
-	StorageBucket     string
-	StorageKey        string
-	OriginalFilename  *string
-	MimeType          string
-	SizeBytes         int64
-	WidthPx           *int
-	HeightPx          *int
-	Sha256            *string
-	Status            string
-	UploadExpiresAt   time.Time
-	CreatedAt         time.Time
-	CompletedAt       *time.Time
+	ID               string
+	OwnerID          string
+	Kind             string
+	StorageBucket    string
+	StorageKey       string
+	OriginalFilename *string
+	MimeType         string
+	SizeBytes        int64
+	WidthPx          *int
+	HeightPx         *int
+	Sha256           *string
+	Status           string
+	UploadExpiresAt  time.Time
+	CreatedAt        time.Time
+	CompletedAt      *time.Time
 }
 
 // CreateAsset creates a new pending asset row.

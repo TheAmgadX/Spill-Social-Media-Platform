@@ -188,6 +188,7 @@ Full OpenAPI spec: [`docs/openapi.yaml`](docs/openapi.yaml)
 | [`docs/openapi.yaml`](docs/openapi.yaml) | OpenAPI 3.0 specification |
 | [`docs/auth.md`](docs/auth.md) | Authentication flow documentation |
 | [`docs/api/`](docs/api/) | Bruno API collection with chained auth flow |
+| [`REMAINING_TASKS.md`](REMAINING_TASKS.md) | Full-stack class project roadmap and remaining tasks |
 
 ---
 

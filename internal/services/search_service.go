@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/TheAmgadX/Spill-Social-Media-Platform/internal/models"
@@ -30,47 +29,22 @@ func NewSearchService(repo SearchRepository, storagePublicBaseURL string) *Searc
 	}
 }
 
-func (s *SearchService) parseOffset(cursorStr string) int {
-	if cursorStr == "" {
-		return 0
-	}
-	if val, err := strconv.Atoi(cursorStr); err == nil && val >= 0 {
-		return val
-	}
-	if b, err := base64.RawURLEncoding.DecodeString(cursorStr); err == nil {
-		if val, err := strconv.Atoi(string(b)); err == nil && val >= 0 {
-			return val
-		}
-	}
-	if b, err := base64.StdEncoding.DecodeString(cursorStr); err == nil {
-		if val, err := strconv.Atoi(string(b)); err == nil && val >= 0 {
-			return val
-		}
-	}
-	return 0
-}
-
 func (s *SearchService) Search(ctx context.Context, q, searchType string, currentUserID *string, limit int, cursorStr string) (*views.SearchResponse, error) {
-	cleanQ := strings.TrimSpace(q)
-	if cleanQ == "" {
-		return nil, fmt.Errorf("%w: query parameter 'q' must not be empty", ErrValidation)
-	}
-	if len([]rune(cleanQ)) > 200 {
-		return nil, fmt.Errorf("%w: query parameter 'q' must not exceed 200 characters", ErrValidation)
+	cleanQ, cleanType, cleanUserID, cleanLimit, offset, err := ValidateSearch(q, searchType, currentUserID, limit, cursorStr)
+	if err != nil {
+		return nil, err
 	}
 
-	offset := s.parseOffset(cursorStr)
-
-	switch searchType {
+	switch cleanType {
 	case "users":
-		users, err := s.repo.SearchUsers(ctx, cleanQ, limit+1, offset)
+		users, err := s.repo.SearchUsers(ctx, cleanQ, cleanLimit+1, offset)
 		if err != nil {
 			return nil, err
 		}
 
-		hasMore := len(users) > limit
+		hasMore := len(users) > cleanLimit
 		if hasMore {
-			users = users[:limit]
+			users = users[:cleanLimit]
 		}
 
 		var data []views.PublicUserResponse
@@ -97,7 +71,7 @@ func (s *SearchService) Search(ctx context.Context, q, searchType string, curren
 
 		var nextCursor *string
 		if hasMore {
-			c := base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset + limit)))
+			c := base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset + cleanLimit)))
 			nextCursor = &c
 		}
 
@@ -105,20 +79,20 @@ func (s *SearchService) Search(ctx context.Context, q, searchType string, curren
 			Data: data,
 			Pagination: views.PaginationMeta{
 				NextCursor: nextCursor,
-				Limit:      limit,
+				Limit:      cleanLimit,
 				HasMore:    hasMore,
 			},
 		}, nil
 
 	case "posts":
-		posts, err := s.repo.SearchPosts(ctx, cleanQ, currentUserID, limit+1, offset)
+		posts, err := s.repo.SearchPosts(ctx, cleanQ, cleanUserID, cleanLimit+1, offset)
 		if err != nil {
 			return nil, err
 		}
 
-		hasMore := len(posts) > limit
+		hasMore := len(posts) > cleanLimit
 		if hasMore {
-			posts = posts[:limit]
+			posts = posts[:cleanLimit]
 		}
 
 		var data []views.PostResponse
@@ -172,7 +146,7 @@ func (s *SearchService) Search(ctx context.Context, q, searchType string, curren
 
 		var nextCursor *string
 		if hasMore {
-			c := base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset + limit)))
+			c := base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset + cleanLimit)))
 			nextCursor = &c
 		}
 
@@ -180,20 +154,20 @@ func (s *SearchService) Search(ctx context.Context, q, searchType string, curren
 			Data: data,
 			Pagination: views.PaginationMeta{
 				NextCursor: nextCursor,
-				Limit:      limit,
+				Limit:      cleanLimit,
 				HasMore:    hasMore,
 			},
 		}, nil
 
 	case "comments":
-		comments, err := s.repo.SearchComments(ctx, cleanQ, limit+1, offset)
+		comments, err := s.repo.SearchComments(ctx, cleanQ, cleanLimit+1, offset)
 		if err != nil {
 			return nil, err
 		}
 
-		hasMore := len(comments) > limit
+		hasMore := len(comments) > cleanLimit
 		if hasMore {
-			comments = comments[:limit]
+			comments = comments[:cleanLimit]
 		}
 
 		var data []views.CommentResponse
@@ -229,7 +203,7 @@ func (s *SearchService) Search(ctx context.Context, q, searchType string, curren
 
 		var nextCursor *string
 		if hasMore {
-			c := base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset + limit)))
+			c := base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset + cleanLimit)))
 			nextCursor = &c
 		}
 
@@ -237,7 +211,7 @@ func (s *SearchService) Search(ctx context.Context, q, searchType string, curren
 			Data: data,
 			Pagination: views.PaginationMeta{
 				NextCursor: nextCursor,
-				Limit:      limit,
+				Limit:      cleanLimit,
 				HasMore:    hasMore,
 			},
 		}, nil

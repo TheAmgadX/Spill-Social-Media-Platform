@@ -10,13 +10,13 @@ import (
 )
 
 type Config struct {
-	AppEnv               string
-	HTTPPort             string
-	DatabaseURL          string
-	MigrationDatabaseURL string
-	StorageBucket        string
-	StoragePublicBaseURL string
-	SupabaseURL          string
+	AppEnv                 string
+	HTTPPort               string
+	DatabaseURL            string
+	MigrationDatabaseURL   string
+	StorageBucket          string
+	StoragePublicBaseURL   string
+	SupabaseURL            string
 	SupabaseServiceRoleKey string
 
 	// Auth & Security
@@ -118,29 +118,29 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		AppEnv:               appEnv,
-		HTTPPort:             port,
-		DatabaseURL:          dbURL,
-		MigrationDatabaseURL: migURL,
-		StorageBucket:        storageBucket,
-		StoragePublicBaseURL: storagePublicBaseURL,
-		SupabaseURL:          supabaseURL,
+		AppEnv:                 appEnv,
+		HTTPPort:               port,
+		DatabaseURL:            dbURL,
+		MigrationDatabaseURL:   migURL,
+		StorageBucket:          storageBucket,
+		StoragePublicBaseURL:   storagePublicBaseURL,
+		SupabaseURL:            supabaseURL,
 		SupabaseServiceRoleKey: supabaseServiceRoleKey,
-		JWTSecret:            jwtSecret,
-		JWTIssuer:            jwtIssuer,
-		AccessTokenTTL:       accessTokenTTL,
-		RefreshTokenTTL:      refreshTokenTTL,
-		SignupTokenTTL:       signupTokenTTL,
-		OTPHMACKey:           otpHmacKey,
-		OTPTTL:               otpTTL,
-		OTPResendCooldown:    otpCooldown,
-		OTPMaxAttempts:       otpMaxAttempts,
-		Mailer:               mailerType,
-		SMTPHost:             os.Getenv("SMTP_HOST"),
-		SMTPPort:             smtpPort,
-		SMTPUsername:         os.Getenv("SMTP_USERNAME"),
-		SMTPPassword:         os.Getenv("SMTP_PASSWORD"),
-		SMTPFrom:             smtpFrom,
+		JWTSecret:              jwtSecret,
+		JWTIssuer:              jwtIssuer,
+		AccessTokenTTL:         accessTokenTTL,
+		RefreshTokenTTL:        refreshTokenTTL,
+		SignupTokenTTL:         signupTokenTTL,
+		OTPHMACKey:             otpHmacKey,
+		OTPTTL:                 otpTTL,
+		OTPResendCooldown:      otpCooldown,
+		OTPMaxAttempts:         otpMaxAttempts,
+		Mailer:                 mailerType,
+		SMTPHost:               os.Getenv("SMTP_HOST"),
+		SMTPPort:               smtpPort,
+		SMTPUsername:           os.Getenv("SMTP_USERNAME"),
+		SMTPPassword:           os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:               smtpFrom,
 	}, nil
 }
 
