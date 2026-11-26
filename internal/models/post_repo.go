@@ -77,8 +77,13 @@ RETURNING id, author_id, body, like_count, comment_count, share_count, created_a
 	)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "P0001" {
-			return nil, &TriggerError{Message: pgErr.Message}
+		if errors.As(err, &pgErr) {
+			if pgErr.Code == "P0001" {
+				return nil, &TriggerError{Message: pgErr.Message}
+			}
+			if pgErr.Code == "23503" { // foreign_key_violation (missing author)
+				return nil, &TriggerError{Message: "author does not exist"}
+			}
 		}
 		return nil, fmt.Errorf("failed to insert post: %w", err)
 	}
@@ -96,6 +101,12 @@ VALUES ($1, $2, $3, now());`
 				}
 				if pgErr.Code == "23514" { // check_violation (e.g. position > 3)
 					return nil, &TriggerError{Message: "posts cannot have more than 4 images"}
+				}
+				if pgErr.Code == "23503" { // foreign_key_violation (missing/non-existent asset)
+					return nil, &TriggerError{Message: fmt.Sprintf("asset %s does not exist or is not available", assetID)}
+				}
+				if pgErr.Code == "23505" { // unique_violation (asset already attached to a post)
+					return nil, &TriggerError{Message: fmt.Sprintf("asset %s is already attached to another post", assetID)}
 				}
 			}
 			return nil, fmt.Errorf("failed to attach asset %s: %w", assetID, err)

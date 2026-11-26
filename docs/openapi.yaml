@@ -3,38 +3,32 @@ info:
   title: Spill Social Media Platform API
   version: 1.0.0
   description: |
-    REST API contract for the Spill social media platform.
+    Complete, source-audited OpenAPI 3.1.0 specification for the Spill Social Media Platform backend.
 
-    ## Authentication
-    All protected endpoints require a Bearer JWT in the `Authorization` header.
-    Access tokens expire after 15 minutes; use the refresh endpoint to rotate.
+    ## Base URLs & Versioning
+    - All domain routes in `internal/routes/routes.go` are mounted under `/api/v1` **and** mirrored at the root `/`. Clients should target `/api/v1`.
+    - System diagnostic routes (`GET /` and `GET /health`) in `cmd/main.go` are mounted **only at root `/`**.
+
+    ## Authentication Schemes
+    - **BearerAuth (Access JWT):** HS256 JWT (`sub=userId`, `role=user|admin`, `iss`, `iat`, `exp`; default TTL 15 minutes). Sent via `Authorization: Bearer <token>`.
+    - **OptionalAuth:** Used on `GET /search`, `GET /posts/{id}`, and `GET /users/{id}/posts`. If a valid Access JWT is supplied, user-specific fields (`liked`) are computed; if missing, malformed, or expired, the request silently proceeds as anonymous (`liked: null`).
+    - **SignupBearerAuth (Signup JWT):** HS256 JWT (`email`, `purpose="signup"`, `sub=email`, `iss`, `iat`, `exp`; default TTL 10 minutes) returned by `POST /auth/verify` for new users. Accepted via `Authorization: Bearer <signupToken>` or in the `POST /auth/signup` JSON body (`signupToken` / `signup_token`, body takes precedence).
+    - **RefreshTokenCookie (`refresh_token`):** HttpOnly cookie (`Path=/auth`, `SameSite=Strict`, `Secure` when TLS is active) set by `POST /auth/verify` (login), `POST /auth/signup`, and `POST /auth/refresh`, and cleared (`MaxAge=-1`) by `POST /auth/logout`.
+
+    ## Global Middleware Behavior
+    - **Max Body Size:** `middleware.MaxBytes(1 << 20)` caps all `/api/v1` (and mirrored root) request bodies at **1 MiB (1,048,576 bytes)**.
+    - **Request Correlation:** `middleware.RequestID` honors incoming `X-Request-ID` or generates `req_<24-hex-chars>`, returning it in the `X-Request-ID` response header and inside `ProblemDetail.requestId`.
+    - **Real IP & Timeouts:** `middleware.RealIP` inspects `X-Real-IP` and `X-Forwarded-For`; `middleware.Timeout` applies a 60s request context timeout; `middleware.Recoverer` catches panics and returns HTTP `500` RFC 9457 `application/problem+json`.
+    - **No HTTP Rate Limiter Middleware:** There is currently no global HTTP `429` rate-limiting middleware. OTP resend throttling is enforced via a 60-second DB cooldown (silently returning `202`), and OTP brute-force protection locks after `5` failed attempts (`401`).
 
     ## Pagination
-    List endpoints use **keyset cursors**. The `cursor` query parameter is an
-    opaque base64-encoded string derived from `(createdAt, id)`. Clients must
-    not parse or construct cursors — just pass the `nextCursor` value from
-    the previous response. Default `limit` is **20**; maximum is **50**.
+    - **Keyset Cursor Endpoints** (`GET /users/{id}/followers`, `GET /users/{id}/following`, `GET /feed`, `GET /users/{id}/posts`, `GET /posts/{id}/comments`): `cursor` is an opaque base64url string encoding `<unix_micros>:<uuid>`.
+    - **Offset Cursor Endpoint** (`GET /search`): `cursor` encodes a non-negative integer offset (base64url or plain integer string).
+    - **`limit` clamping:** `controllers.parseLimit` silently falls back to `20` if `limit` is omitted, non-numeric, or `< 1`, and silently clamps values `> 50` to `50`.
+    - **Empty List Serialization Quirk:** Non-search list endpoints return `"data": null` when zero rows match; `GET /search` returns `"data": []`.
 
-    ## Errors
-    All errors use [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json`.
-
-    ## Idempotency
-    `PUT /posts/{id}/like` and `PUT /users/{id}/follow` return **200** with
-    the current state whether or not anything actually changed (insert-on-conflict-do-nothing).
-
-    ## Naming Conventions
-    - Paths: plural nouns, lowercase kebab-case.
-    - JSON fields: camelCase.
-
-    ## Proposed Validation Limits (pending team confirmation)
-    | Field | Constraint |
-    |---|---|
-    | `displayName` | 1–50 characters |
-    | `username` | 3–20 characters, `^[a-z0-9_]{3,20}$` |
-    | `post body` | 1–2 000 characters |
-    | `comment body` | 1–500 characters |
-    | `asset mimeType` | `image/jpeg`, `image/png`, `image/webp` |
-    | `asset sizeBytes` | 1 byte – 5 242 880 bytes (5 MB) |
+    ## Error Envelope
+    All API errors (except `GET /health` `503`) return [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json` via `views.WriteProblem`.
 
   contact:
     name: Spill Engineering
@@ -44,99 +38,224 @@ info:
 
 servers:
   - url: http://localhost:8080/api/v1
-    description: Local development
+    description: Local development (versioned prefix — recommended)
+  - url: http://localhost:8080
+    description: Local development (root alias & system health endpoints)
 
 tags:
+  - name: System
+    description: Service status and database health checks (mounted at root `/` only)
   - name: Auth
-    description: Passwordless email-code authentication
+    description: Passwordless email-code authentication, signup, token rotation, and logout
   - name: Users
     description: User profiles and follow graph
   - name: Posts
-    description: Create, read, update, and delete posts
-  - name: Interactions
-    description: Likes, comments, and shares
-  - name: Assets
-    description: Presigned image uploads
-  - name: Search
-    description: Full-text search across users, posts, and comments
+    description: Create, read, update, and soft-delete posts
   - name: Feed
-    description: Home timeline
+    description: Authenticated home timeline
+  - name: Interactions
+    description: Likes, shares, and comments
+  - name: Assets
+    description: Presigned image uploads via Supabase Storage
+  - name: Search
+    description: Full-text and prefix search across users, posts, and comments
 
 # ─────────────────────────────────────────────────────────────
-# Reusable components
+# Reusable Components
 # ─────────────────────────────────────────────────────────────
 components:
 
-  # ── Security ───────────────────────────────────────────────
   securitySchemes:
     BearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: Access JWT (sub=userId, role, exp). 15 min lifetime.
+      description: |
+        Access JWT signed with HS256 (`sub=userId`, `role=user|admin`, `iss`, `iat`, `exp`).
+        Default lifetime: 15 minutes (`ACCESS_TOKEN_TTL`).
+    SignupBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Short-lived HS256 JWT (`email`, `purpose="signup"`, `sub=email`, `iss`, `iat`, `exp`).
+        Default lifetime: 10 minutes (`SIGNUP_TOKEN_TTL`). Obtained from `POST /auth/verify` when `action="signup"`.
+    RefreshCookieAuth:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+      description: |
+        HttpOnly cookie (`Path=/auth`, `SameSite=Strict`, `Secure` when TLS is active) containing the 32-byte base64url opaque refresh token (30-day TTL).
 
-  # ── Parameters ─────────────────────────────────────────────
   parameters:
+    RequestIdHeader:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: Optional client-supplied correlation ID. If omitted, the server generates `req_<24-hex-chars>`. Echoed in response headers and `ProblemDetail.requestId`.
+      schema:
+        type: string
+      example: "req_client_trace_001"
+    UserAgentHeader:
+      name: User-Agent
+      in: header
+      required: false
+      description: Client user-agent stored on refresh token sessions (trimmed, truncated to 512 bytes; null bytes rejected).
+      schema:
+        type: string
+      example: "SpillWeb/1.0 (Linux; x86_64)"
     CursorParam:
       name: cursor
       in: query
       required: false
-      description: Opaque base64 keyset cursor from a previous response's `nextCursor`.
+      description: |
+        Opaque base64 keyset cursor (`<unix_micros>:<uuid>`) from a previous response's `pagination.nextCursor`.
+        Accepts `base64.RawURLEncoding`, `base64.URLEncoding`, or `base64.StdEncoding`. Empty string `""` is treated as omitted; arbitrary non-cursor strings (e.g. `not-a-valid-cursor!!!`) are rejected with `422`.
       schema:
         type: string
+        pattern: "^$|^([A-Za-z0-9+/_-]{50,}={0,2})$"
+      examples:
+        firstPage:
+          summary: Omit or empty for first page
+          value: ""
+        nextPage:
+          summary: Valid base64url keyset cursor
+          value: "MTczMjY0MjIwMDAwMDAwMDphMWIyYzNkNC1lNWY2LTQ3ODktOGFiYy1kZWYwMTIzNDU2Nzg"
+      x-invalid-examples:
+        invalidCursor:
+          summary: Malformed cursor (triggers 422)
+          value: "not-a-valid-cursor!!!"
+    SearchCursorParam:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Offset cursor for `GET /search`. Encodes a non-negative integer offset as `base64.RawURLEncoding` (e.g. `"MjA"` for offset 20),
+        `base64.StdEncoding`, or plain non-negative integer string (e.g. `"20"`). Negative integers (e.g. `-5`) or non-numeric strings are rejected with `422`.
+      schema:
+        type: string
+        pattern: "^$|^([0-9]+|[MNO][A-Za-z0-9+/_-]*={0,2})$"
+      examples:
+        encodedOffset:
+          summary: Base64url-encoded offset 20
+          value: "MjA"
+        plainOffset:
+          summary: Plain integer offset 20
+          value: "20"
+      x-invalid-examples:
+        negativeOffset:
+          summary: Negative offset (triggers 422)
+          value: "-5"
     LimitParam:
       name: limit
       in: query
       required: false
-      description: Number of items per page. Default 20, max 50.
+      description: |
+        Number of items per page (effective range 1–50). Values `< 1` silently default to `20`; values `> 50` are silently clamped to `50`, and the server returns `200 OK`.
       schema:
         type: integer
-        minimum: 1
-        maximum: 50
         default: 20
+      examples:
+        defaultLimit:
+          summary: Default page size
+          value: 20
+        minLimit:
+          summary: Minimum page size
+          value: 1
+        maxLimit:
+          summary: Maximum page size
+          value: 50
+        clampedOverMax:
+          summary: Over-limit value (silently clamped to 50)
+          value: 100
     PostIdParam:
       name: id
       in: path
       required: true
-      description: Post UUID.
+      description: Non-nil Post UUID.
       schema:
         type: string
         format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440001"
     UserIdParam:
       name: id
       in: path
       required: true
-      description: User UUID.
+      description: Non-nil User UUID.
       schema:
         type: string
         format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440000"
     UsernameParam:
       name: username
       in: path
       required: true
-      description: Unique username (case-insensitive).
+      description: Unique username (`^[a-z0-9_]{3,20}$`). DB column is `citext`, but route validation enforces lowercase `a-z0-9_` and maps invalid formats directly to `404`.
       schema:
         type: string
+        minLength: 3
+        maxLength: 20
         pattern: "^[a-z0-9_]{3,20}$"
+      example: "alice_dev"
     AssetIdParam:
       name: id
       in: path
       required: true
-      description: Asset UUID.
+      description: Non-nil Asset UUID.
       schema:
         type: string
         format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440002"
     CommentIdParam:
       name: id
       in: path
       required: true
-      description: Comment UUID.
+      description: Non-nil Comment UUID.
       schema:
         type: string
         format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440003"
 
-  # ── Schemas ────────────────────────────────────────────────
+  headers:
+    XRequestIDResponse:
+      description: Echoed or server-generated request correlation ID (`req_<24-hex-chars>`).
+      schema:
+        type: string
+      example: "req_9f8a7b6c5d4e3f2a1b0c9d8e"
+    SetRefreshCookieHeader:
+      description: HttpOnly `refresh_token` cookie (`Path=/auth; HttpOnly; SameSite=Strict`; `Secure` when TLS is active).
+      schema:
+        type: string
+      example: "refresh_token=dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g; Path=/auth; HttpOnly; SameSite=Strict"
+
   schemas:
+
+    # ── System DTOs ─────────────────────────────────────────
+    RootStatusResponse:
+      type: object
+      required: [app, status, env, db_user]
+      properties:
+        app:
+          type: string
+        status:
+          type: string
+          enum: [ok]
+        env:
+          type: string
+        db_user:
+          type: string
+
+    HealthHealthyResponse:
+      type: object
+      required: [status, current_user, server_version]
+      properties:
+        status:
+          type: string
+          enum: [healthy]
+        current_user:
+          type: string
+        server_version:
+          type: string
 
     # ── Error (RFC 9457) ────────────────────────────────────
     ProblemDetail:
@@ -146,41 +265,38 @@ components:
         type:
           type: string
           format: uri
-          description: A URI reference identifying the problem type.
-          examples: ["https://api.spill.social/problems/validation-error"]
+          description: Problem type URI (`https://api.spill.social/problems/<slug>`).
         title:
           type: string
-          description: Short human-readable summary.
-          examples: ["Validation Error"]
+          description: Standard HTTP status title.
         status:
           type: integer
           description: HTTP status code.
-          examples: [422]
         detail:
           type: string
-          description: Human-readable explanation specific to this occurrence.
-          examples: ["Field 'body' must be between 1 and 2000 characters."]
+          description: Specific error explanation returned by controller, middleware, or service layer.
         requestId:
           type: string
-          description: Correlation ID for support/debugging.
-          examples: ["req_abc123"]
+          description: Request correlation ID (`req_...`).
 
-    # ── Pagination envelope ─────────────────────────────────
+    # ── Pagination Envelope ─────────────────────────────────
     PaginationMeta:
       type: object
-      required: [limit, hasMore]
+      required: [nextCursor, limit, hasMore]
       properties:
         nextCursor:
           type:
             - string
             - "null"
-          description: Opaque cursor to fetch the next page. Null when no more items.
+          description: Opaque cursor to fetch the next page, or `null` when no more items exist.
         limit:
           type: integer
-          description: Items per page.
+          minimum: 1
+          maximum: 50
+          description: Effective clamped page size.
         hasMore:
           type: boolean
-          description: True when more items exist beyond this page.
+          description: True when at least one additional item exists beyond this page.
 
     # ── Auth DTOs ───────────────────────────────────────────
     RequestCodeRequest:
@@ -190,7 +306,18 @@ components:
         email:
           type: string
           format: email
+          minLength: 5
           maxLength: 254
+          pattern: "^\\s*[^@\\s]+@[^@\\s]+\\.[^@\\s]+\\s*$"
+          description: Target email address (trimmed and lowercased server-side; max 254 characters per RFC 5321; disposable domains are rejected with 422).
+
+    RequestCodeResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          example: "If the email is valid, a login code has been sent."
 
     VerifyCodeRequest:
       type: object
@@ -199,21 +326,30 @@ components:
         email:
           type: string
           format: email
+          minLength: 5
           maxLength: 254
+          pattern: "^\\s*[^@\\s]+@[^@\\s]+\\.[^@\\s]+\\s*$"
         code:
           type: string
           minLength: 6
           maxLength: 6
           pattern: "^[0-9]{6}$"
+          description: 6-digit numeric OTP.
 
     VerifyCodeResponse:
       type: object
       required: [action]
+      description: |
+        Note: `views.VerifyCodeResponse` serializes both camelCase and snake_case token keys simultaneously (`accessToken` + `access_token`, etc.).
+        `new_user` uses `omitempty` so it is `true` for signup and omitted (`false`) for login.
       properties:
         action:
           type: string
           enum: [login, signup]
-          description: "`login` when the user already exists, `signup` when they need to register."
+          description: "`login` for existing users, `signup` for new users."
+        new_user:
+          type: boolean
+          description: Present (`true`) when `action` is `signup`; omitted when `action` is `login`.
         accessToken:
           type: string
           description: Present when `action` is `login`.
@@ -222,25 +358,53 @@ components:
           description: Present when `action` is `login`.
         signupToken:
           type: string
-          description: Present when `action` is `signup`. Short-lived JWT carrying the verified email claim.
+          description: Present when `action` is `signup`.
+        access_token:
+          type: string
+          description: Snake-case duplicate of `accessToken` when `action` is `login`.
+        refresh_token:
+          type: string
+          description: Snake-case duplicate of `refreshToken` when `action` is `login`.
+        signup_token:
+          type: string
+          description: Snake-case duplicate of `signupToken` when `action` is `signup`.
 
     SignupRequest:
       type: object
       required: [username, displayName, birthdate]
+      description: |
+        Accepts `signupToken` or `signup_token` (or `Authorization: Bearer <signupToken>` header), and `displayName` or `display_name`.
       properties:
+        signupToken:
+          type: string
+          description: "Optional in body if passed in `Authorization: Bearer` header. Body takes precedence."
+        signup_token:
+          type: string
+          description: Snake-case alias for `signupToken`.
         username:
           type: string
           minLength: 3
           maxLength: 20
-          pattern: "^[a-z0-9_]{3,20}$"
+          pattern: "^[a-z0-9][a-z0-9_]{1,18}[a-z0-9]$"
+          not:
+            enum: [admin, root, system, api, support, help, official, moderator]
+          description: Must be 3–20 lowercase alphanumeric/underscore characters, must not start/end with `_`, and must not be a reserved word (`admin`, `root`, `system`, `api`, `support`, `help`, `official`, `moderator`).
         displayName:
           type: string
           minLength: 1
           maxLength: 50
+          pattern: ".*\\S.*"
+          description: Trimmed Unicode rune count 1–50; must contain non-whitespace; no control characters or null bytes.
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 50
+          pattern: ".*\\S.*"
+          description: Snake-case alias for `displayName` (used if `displayName` is empty).
         birthdate:
           type: string
           format: date
-          description: "ISO 8601 date. User must be ≥ 13 years old."
+          description: "ISO 8601 date (`YYYY-MM-DD`), strictly after `1900-01-01`; user must be >= 13 years old."
 
     SignupResponse:
       type: object
@@ -250,15 +414,31 @@ components:
           type: string
         refreshToken:
           type: string
+        access_token:
+          type: string
+        refresh_token:
+          type: string
         user:
           $ref: "#/components/schemas/PrivateUserResponse"
 
     RefreshRequest:
       type: object
-      required: [refreshToken]
+      description: |
+        Requires `refreshToken` or `refresh_token` in the JSON body whenever the `refresh_token` HttpOnly cookie is not sent.
+        An empty object `{}` (or empty body) is ONLY valid when a valid `refresh_token` cookie is included on the request; otherwise the server returns `422`.
+      anyOf:
+        - required: [refreshToken]
+        - required: [refresh_token]
       properties:
         refreshToken:
           type: string
+          minLength: 1
+          pattern: "^\\S+$"
+        refresh_token:
+          type: string
+          minLength: 1
+          pattern: "^\\S+$"
+          description: Snake-case alias for `refreshToken`.
 
     TokenResponse:
       type: object
@@ -268,19 +448,26 @@ components:
           type: string
         refreshToken:
           type: string
+        access_token:
+          type: string
+        refresh_token:
+          type: string
 
     LogoutRequest:
       type: object
-      required: [refreshToken]
+      description: Optional JSON body; falls back to `refresh_token` cookie if omitted.
       properties:
         refreshToken:
           type: string
+        refresh_token:
+          type: string
+          description: Snake-case alias for `refreshToken`.
 
     # ── User DTOs ───────────────────────────────────────────
     PublicUserResponse:
       type: object
-      description: Public profile — excludes email and birthdate.
-      required: [id, username, displayName, role, followerCount, followingCount, createdAt]
+      description: Public profile — omits `email` and `birthdate`.
+      required: [id, username, displayName, avatarUrl, role, followerCount, followingCount, createdAt]
       properties:
         id:
           type: string
@@ -299,16 +486,18 @@ components:
           enum: [user, admin]
         followerCount:
           type: integer
+          minimum: 0
         followingCount:
           type: integer
+          minimum: 0
         createdAt:
           type: string
           format: date-time
 
     PrivateUserResponse:
       type: object
-      description: Full profile returned only by GET /me. Includes email and birthdate.
-      required: [id, username, email, displayName, birthdate, role, followerCount, followingCount, createdAt]
+      description: Authenticated user's full profile returned by `GET /me`, `PATCH /me`, and `POST /auth/signup`. Includes `email` and `birthdate`.
+      required: [id, username, email, displayName, birthdate, avatarUrl, role, followerCount, followingCount, createdAt]
       properties:
         id:
           type: string
@@ -333,25 +522,48 @@ components:
           enum: [user, admin]
         followerCount:
           type: integer
+          minimum: 0
         followingCount:
           type: integer
+          minimum: 0
         createdAt:
           type: string
           format: date-time
 
     UpdateMeRequest:
       type: object
+      minProperties: 1
+      anyOf:
+        - required: [displayName]
+        - required: [display_name]
+        - required: [avatarAssetId]
+        - required: [avatar_asset_id]
+      description: |
+        At least one field (`displayName`/`display_name` or `avatarAssetId`/`avatar_asset_id`) must be provided.
+        Both camelCase and snake_case keys are accepted (camelCase takes precedence).
       properties:
         displayName:
           type: string
           minLength: 1
           maxLength: 50
+          pattern: ".*\\S.*"
+          description: Trimmed rune length 1–50; no control characters. Passing `null` fails validation (422).
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 50
+          pattern: ".*\\S.*"
         avatarAssetId:
           type:
             - string
             - "null"
           format: uuid
-          description: Set to null to remove the avatar.
+          description: Must reference a `ready` asset with `kind="avatar"` owned by the caller. Set to `null` to remove the avatar.
+        avatar_asset_id:
+          type:
+            - string
+            - "null"
+          format: uuid
 
     FollowStateResponse:
       type: object
@@ -359,14 +571,16 @@ components:
       properties:
         following:
           type: boolean
-          description: Current follow state after the operation.
 
     UserListResponse:
       type: object
       required: [data, pagination]
       properties:
         data:
-          type: array
+          type:
+            - array
+            - "null"
+          description: List of users, or `null` when empty due to nil Go slice serialization.
           items:
             $ref: "#/components/schemas/PublicUserResponse"
         pagination:
@@ -375,7 +589,7 @@ components:
     # ── Post DTOs ───────────────────────────────────────────
     PostResponse:
       type: object
-      required: [id, authorId, body, likeCount, commentCount, shareCount, createdAt]
+      required: [id, authorId, body, likeCount, commentCount, shareCount, liked, createdAt]
       properties:
         id:
           type: string
@@ -389,24 +603,62 @@ components:
           type: string
         assets:
           type: array
+          description: Ordered list of attached image assets (empty array `[]` when none).
           items:
             $ref: "#/components/schemas/AssetResponse"
         likeCount:
           type: integer
+          minimum: 0
         commentCount:
           type: integer
+          minimum: 0
         shareCount:
           type: integer
+          minimum: 0
         liked:
           type:
             - boolean
             - "null"
-          description: Whether the authenticated user has liked this post. Null for anonymous.
+          description: True/false when authenticated, `null` when anonymous or token is invalid.
         createdAt:
           type: string
           format: date-time
 
     CreatePostRequest:
+      type: object
+      description: |
+        Must provide either non-whitespace `body` text, or 1–4 `assetIds`, or both.
+        When `assetIds` is non-empty, `body` may be omitted or empty (`""`).
+      anyOf:
+        - required: [body]
+          properties:
+            body:
+              type: string
+              minLength: 1
+              maxLength: 2000
+              pattern: ".*\\S.*"
+        - required: [assetIds]
+          properties:
+            assetIds:
+              type: array
+              minItems: 1
+              maxItems: 4
+      properties:
+        body:
+          type: string
+          maxLength: 2000
+          default: ""
+          description: Post text (0–2000 Unicode runes; `\t`, `\n`, `\r` allowed; null bytes and other control chars rejected). Required to be non-whitespace if `assetIds` is empty.
+        assetIds:
+          type: array
+          maxItems: 4
+          uniqueItems: true
+          description: Up to 4 unique UUIDs of `ready`, `post_image` assets owned by the caller and not already attached to another post.
+          items:
+            type: string
+            format: uuid
+
+    UpdatePostRequest:
       type: object
       required: [body]
       properties:
@@ -414,27 +666,18 @@ components:
           type: string
           minLength: 1
           maxLength: 2000
-        assetIds:
-          type: array
-          maxItems: 10
-          items:
-            type: string
-            format: uuid
-
-    UpdatePostRequest:
-      type: object
-      properties:
-        body:
-          type: string
-          minLength: 1
-          maxLength: 2000
+          pattern: ".*\\S.*"
+          description: Non-whitespace post body (1–2000 Unicode runes; `\t`, `\n`, `\r` allowed).
 
     PostListResponse:
       type: object
       required: [data, pagination]
       properties:
         data:
-          type: array
+          type:
+            - array
+            - "null"
+          description: List of posts, or `null` when empty due to nil Go slice serialization.
           items:
             $ref: "#/components/schemas/PostResponse"
         pagination:
@@ -447,7 +690,6 @@ components:
       properties:
         liked:
           type: boolean
-          description: Current like state after the operation.
 
     CommentResponse:
       type: object
@@ -478,13 +720,18 @@ components:
           type: string
           minLength: 1
           maxLength: 1000
+          pattern: ".*\\S.*"
+          description: Non-whitespace comment text (1–1000 Unicode runes; `\t`, `\n`, `\r` allowed).
 
     CommentListResponse:
       type: object
       required: [data, pagination]
       properties:
         data:
-          type: array
+          type:
+            - array
+            - "null"
+          description: List of comments, or `null` when empty due to nil Go slice serialization.
           items:
             $ref: "#/components/schemas/CommentResponse"
         pagination:
@@ -492,7 +739,7 @@ components:
 
     ShareResponse:
       type: object
-      required: [id, userId, postId, createdAt]
+      required: [id, userId, postId, quote, createdAt]
       properties:
         id:
           type: string
@@ -519,6 +766,7 @@ components:
             - string
             - "null"
           maxLength: 500
+          description: Optional commentary quote (0–500 Unicode runes; `\t`, `\n`, `\r` allowed). On repeated share of the same post, `null`/omitted preserves the existing quote.
 
     # ── Asset DTOs ──────────────────────────────────────────
     CreateAssetRequest:
@@ -527,15 +775,19 @@ components:
       properties:
         mimeType:
           type: string
-          enum:
-            - image/jpeg
-            - image/png
-            - image/webp
+          enum: [image/jpeg, image/png, image/webp]
+          description: Trimmed and lowercased server-side before enum validation.
         sizeBytes:
           type: integer
+          format: int64
           minimum: 1
           maximum: 5242880
-          description: File size in bytes. Maximum 5 MB (5 242 880 bytes).
+          description: Exact byte size of file to upload (1 to 5,242,880 bytes = 5 MiB). Values `> 5242880` return `413`; values `< 1` return `422`.
+        kind:
+          type: string
+          enum: [post_image, avatar]
+          default: post_image
+          description: Optional asset purpose (trimmed and lowercased server-side). Defaults to `"post_image"` if omitted or empty.
 
     CreateAssetResponse:
       type: object
@@ -547,7 +799,7 @@ components:
         presignedPutUrl:
           type: string
           format: uri
-          description: Upload the file via HTTP PUT to this URL.
+          description: Signed Supabase Storage PUT upload URL. Must be uploaded within 1 hour before cleanup purge.
 
     AssetResponse:
       type: object
@@ -561,8 +813,10 @@ components:
           format: uri
         mimeType:
           type: string
+          enum: [image/jpeg, image/png, image/webp]
         sizeBytes:
           type: integer
+          format: int64
         status:
           type: string
           enum: [pending, ready]
@@ -585,6 +839,7 @@ components:
       properties:
         data:
           type: array
+          description: Non-null array of `PublicUserResponse`, `PostResponse`, or `CommentResponse` matching the requested `type`.
           items:
             oneOf:
               - $ref: "#/components/schemas/PublicUserResponse"
@@ -593,129 +848,236 @@ components:
         pagination:
           $ref: "#/components/schemas/PaginationMeta"
 
-  # ── Reusable responses ─────────────────────────────────────
+  # ── Reusable Error Responses ───────────────────────────────
   responses:
     BadRequest:
-      description: Bad request — malformed JSON or missing required field.
+      description: Malformed JSON payload or oversized request body (> 1 MiB).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestIDResponse"
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/bad-request"
-            title: "Bad Request"
-            status: 400
-            detail: "Request body is not valid JSON."
-            requestId: "req_abc123"
+          examples:
+            malformedJson:
+              summary: Malformed JSON body
+              value:
+                type: "https://api.spill.social/problems/bad-request"
+                title: "Bad Request"
+                status: 400
+                detail: "Invalid JSON request body."
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+            bodyTooLarge:
+              summary: Request body exceeds 1 MiB MaxBytes limit
+              value:
+                type: "https://api.spill.social/problems/bad-request"
+                title: "Bad Request"
+                status: 400
+                detail: "Invalid JSON request body."
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
 
     Unauthorized:
-      description: Missing or invalid authentication token.
+      description: Missing, malformed, or expired Bearer token (or invalid credentials).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestIDResponse"
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/unauthorized"
-            title: "Unauthorized"
-            status: 401
-            detail: "Bearer token is missing or expired."
-            requestId: "req_abc123"
+          examples:
+            missingHeader:
+              summary: Authorization header missing
+              value:
+                type: "https://api.spill.social/problems/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "authorization header required"
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+            invalidHeaderFormat:
+              summary: Authorization header is not Bearer <token>
+              value:
+                type: "https://api.spill.social/problems/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "invalid authorization header format, expected Bearer <token>"
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+            invalidOrExpiredToken:
+              summary: Invalid signature, wrong alg, or expired JWT
+              value:
+                type: "https://api.spill.social/problems/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "invalid or expired access token"
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
 
     Forbidden:
-      description: Authenticated but lacking permission.
+      description: Authenticated caller is neither the resource owner nor an admin.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestIDResponse"
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/forbidden"
-            title: "Forbidden"
-            status: 403
-            detail: "You do not have permission to perform this action."
-            requestId: "req_abc123"
+          examples:
+            notOwner:
+              summary: Caller does not own the resource and lacks admin role
+              value:
+                type: "https://api.spill.social/problems/forbidden"
+                title: "Forbidden"
+                status: 403
+                detail: "You do not have permission to perform this action."
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
 
     NotFound:
-      description: Resource not found.
+      description: Target resource does not exist or has been soft-deleted.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestIDResponse"
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/not-found"
-            title: "Not Found"
-            status: 404
-            detail: "The requested resource was not found."
-            requestId: "req_abc123"
-
-    Conflict:
-      description: Conflict — resource already exists.
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/conflict"
-            title: "Conflict"
-            status: 409
-            detail: "Username is already taken."
-            requestId: "req_abc123"
-
-    PayloadTooLarge:
-      description: Request body exceeds the allowed limit.
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/payload-too-large"
-            title: "Payload Too Large"
-            status: 413
-            detail: "Asset size must not exceed 5 242 880 bytes (5 MB)."
-            requestId: "req_abc123"
-
-    UnprocessableEntity:
-      description: Validation error — request was well-formed but semantically invalid.
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/validation-error"
-            title: "Unprocessable Entity"
-            status: 422
-            detail: "Field 'body' must be between 1 and 2000 characters."
-            requestId: "req_abc123"
-
-    TooManyRequests:
-      description: Rate limit exceeded.
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/rate-limit-exceeded"
-            title: "Too Many Requests"
-            status: 429
-            detail: "Rate limit exceeded. Try again later."
-            requestId: "req_abc123"
+          examples:
+            resourceNotFound:
+              summary: Record missing or soft-deleted
+              value:
+                type: "https://api.spill.social/problems/not-found"
+                title: "Not Found"
+                status: 404
+                detail: "The requested resource was not found."
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
 
     InternalServerError:
-      description: Unexpected server error.
+      description: Unexpected database, storage, or unhandled panic error.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestIDResponse"
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetail"
-          example:
-            type: "https://api.spill.social/problems/internal-error"
-            title: "Internal Server Error"
-            status: 500
-            detail: "An unexpected error occurred."
-            requestId: "req_abc123"
+          examples:
+            unexpectedError:
+              summary: Generic internal error or panic recovery
+              value:
+                type: "https://api.spill.social/problems/internal-error"
+                title: "Internal Server Error"
+                status: 500
+                detail: "An unexpected server error occurred."
+                requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
 
 # ─────────────────────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────────────────────
 paths:
+
+  # ═══════════════════════════════════════════════════════════
+  # SYSTEM (Root-mounted only)
+  # ═══════════════════════════════════════════════════════════
+
+  /:
+    servers:
+      - url: http://localhost:8080
+        description: Root server (system endpoints are not mounted under /api/v1)
+    get:
+      operationId: getApiRoot
+      summary: Get API status metadata
+      description: |
+        Returns basic service identity, environment (`APP_ENV`), and connected PostgreSQL role (`api_app`).
+        Mounted only at `/` (not under `/api/v1`).
+
+        **Team Notes Summary:**
+        - **Front-End:** Smoke-test endpoint; not needed for client app state.
+        - **QA:** Verify `db_user` reports `api_app` (non-superuser application role).
+      tags: [System]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+      responses:
+        "200":
+          description: API is up.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RootStatusResponse"
+              examples:
+                development:
+                  summary: Local development response
+                  value:
+                    app: "Spill Social Media Platform API"
+                    status: "ok"
+                    env: "development"
+                    db_user: "api_app"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Mounted at root `/` only, not `/api/v1/`."
+        qa:
+          - "Verify `db_user` equals `api_app` to confirm least-privilege DB connection."
+
+  /health:
+    servers:
+      - url: http://localhost:8080
+        description: Root server (system endpoints are not mounted under /api/v1)
+    get:
+      operationId: getHealth
+      summary: Database connectivity health check
+      description: |
+        Pings PostgreSQL with a 2-second context timeout and returns connection metadata.
+        Mounted only at `/health` (not under `/api/v1`).
+
+        **Team Notes Summary:**
+        - **Front-End / Infra:** Expect `503` with `text/plain` content-type (not `application/problem+json`) when PostgreSQL is unreachable.
+        - **QA:** Test DB outage scenario; note `http.Error` writes JSON text with `Content-Type: text/plain; charset=utf-8`.
+      tags: [System]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+      responses:
+        "200":
+          description: Database connection is healthy.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthHealthyResponse"
+              examples:
+                healthy:
+                  summary: Healthy DB ping
+                  value:
+                    status: "healthy"
+                    current_user: "api_app"
+                    server_version: "16.4"
+        "503":
+          description: Database unreachable within 2-second ping timeout. Returned via `http.Error` (`text/plain; charset=utf-8`).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            text/plain:
+              schema:
+                type: string
+              examples:
+                dbUnreachable:
+                  summary: Database ping failed or timed out
+                  value: '{"status":"error","message":"database unreachable"}'
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Used by load balancers / uptime probes; not mounted under `/api/v1`."
+          - "`503` error body is JSON-formatted text served with `Content-Type: text/plain; charset=utf-8` via `http.Error`, not `application/problem+json`."
+        qa:
+          - "Ping timeout is hardcoded to 2 seconds; simulate DB pause/network drop to verify `503`."
 
   # ═══════════════════════════════════════════════════════════
   # AUTH
@@ -726,147 +1088,661 @@ paths:
       operationId: requestCode
       summary: Request a one-time login code
       description: |
-        Sends a 6-digit OTP to the given email address.
-        Always returns 202 to prevent email enumeration.
+        Validates the email per RFC 5321/5322 (`<= 254` chars, non-disposable domain), generates a 6-digit numeric OTP, hashes it with HMAC-SHA256 (`OTP_HMAC_KEY`), persists it to `login_codes` with a 10-minute TTL (`OTP_TTL`), and emails it via the configured mailer (`mailpit` or `smtp`).
+        Enforces a 60-second resend cooldown (`OTP_RESEND_COOLDOWN`); requests within the cooldown window silently return `202 Accepted` without sending a new email to prevent enumeration.
+
+        **Team Notes Summary:**
+        - **Front-End:** Invalid email syntax, length `> 254`, or disposable domains return `422`. Start a 60-second UI resend timer immediately on `202`.
+        - **QA:** Disposable domains (`mailinator.com`, `10minutemail.com`, `guerrillamail.com`, `tempmail.com`, `throwawaymail.com`, `yopmail.com`, `sharklasers.com`, `dispostable.com`) and oversized emails (`> 254` chars) are rejected with `422` at the controller.
       tags: [Auth]
       security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/RequestCodeRequest"
+            examples:
+              validMinimal:
+                summary: Valid minimal payload
+                value:
+                  email: "alice@example.com"
+              validWithWhitespaceAndCase:
+                summary: Valid full/edge-case email (trimmed & lowercased)
+                value:
+                  email: "  Alice.Dev+test@Example.COM  "
+            x-invalid-examples:
+              invalidMissingAt:
+                summary: Invalid email missing '@' (triggers 422)
+                value:
+                  email: "not-an-email"
+              invalidEmptyEmail:
+                summary: Invalid empty email (triggers 422)
+                value:
+                  email: "   "
+              invalidTooLongEmail:
+                summary: Invalid email exceeding 254 chars (triggers 422)
+                value:
+                  email: "0@0.com********************************************************************************************************************************************************************************************************************************************************"
+              invalidMalformedJson:
+                summary: Invalid malformed JSON syntax (triggers 422)
+                value: "{email:"
+              invalidDisposableDomain:
+                summary: Disposable domain (triggers 422)
+                value:
+                  email: "test@mailinator.com"
       responses:
         "202":
-          description: Accepted — code sent (or silently dropped if on cooldown).
-        "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Accepted — verification code sent, or silently ignored (cooldown / invalid domain / disposable email) to prevent enumeration.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestCodeResponse"
+              examples:
+                accepted:
+                  summary: Standard 202 response
+                  value:
+                    message: "If the email is valid, a login code has been sent."
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
+          description: Malformed JSON body (or > 1 MiB) or email failing RFC 5321/5322 validation (empty, > 254 chars, invalid domain, or disposable domain).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                malformedJson:
+                  summary: ValidationError - Malformed or oversized JSON
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "invalid request body"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                emailTooLong:
+                  summary: ValidationError - Email exceeds 254 characters
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: email exceeds maximum length of 254 characters"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidEmailFormat:
+                  summary: ValidationError - Empty or malformed email address
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid email address format"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                disposableDomain:
+                  summary: ValidationError - Disposable email domain rejected
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: disposable email domains are not accepted"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Always treat `202` as 'check your inbox' and enforce a 60s resend countdown in the UI."
+          - "Does NOT return `429`; duplicate requests within 60s silently return `202` without sending a new email."
+          - "Malformed JSON returns `422` (`invalid request body`), not `400`."
+        qa:
+          - "Verify Mailpit (`localhost:1025`/`8025`) or `MockMailer` receives an email for valid addresses, and rejects `mailinator.com` or > 254-char emails with `422`."
+          - "Note quirk in `AuthController.RequestCode`: `_ = c.authService.RequestCode(...)` discards downstream DB/SMTP errors into `202`, while syntactic/length validation fails fast with `422`."
+          - "Check boundary: email length = 254 chars (accepted `202`) vs 255 chars (rejected `422`)."
 
   /auth/verify:
     post:
       operationId: verifyCode
       summary: Verify the email OTP
       description: |
-        Validates the 6-digit code. Returns tokens for existing users,
-        or a short-lived `signupToken` for new users who must call `/auth/signup`.
+        Verifies the latest unconsumed, unexpired 6-digit OTP for the email using constant-time HMAC-SHA256 comparison.
+        - **Existing user:** Consumes the code, issues an Access JWT + Refresh Token, sets the `refresh_token` HttpOnly cookie (`Path=/auth; SameSite=Strict`), and returns `action: "login"`.
+        - **New user:** Consumes the code, issues a 10-minute `signupToken` JWT, and returns `action: "signup"` with `new_user: true`. Caller must then invoke `POST /auth/signup`.
+        - **Brute-force lockout:** Rejects with `401` once `attempts >= 5` (`OTP_MAX_ATTEMPTS`).
+
+        **Team Notes Summary:**
+        - **Front-End:** Check `action === "login"` vs `"signup"`. Response includes both camelCase (`accessToken`) and snake_case (`access_token`) keys; `refresh_token` is also set as an HttpOnly cookie.
+        - **QA:** Verify 5 wrong attempts lock out the active code (`401 maximum verification attempts exceeded`) and atomic `MarkCodeConsumed` prevents concurrent OTP replay.
       tags: [Auth]
       security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+        - $ref: "#/components/parameters/UserAgentHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/VerifyCodeRequest"
+            examples:
+              validMinimal:
+                summary: Valid minimal payload
+                value:
+                  email: "alice@example.com"
+                  code: "482910"
+              validWithWhitespace:
+                summary: Valid payload with surrounding whitespace (trimmed server-side)
+                value:
+                  email: "  Alice@Example.com "
+                  code: " 482910 "
+            x-invalid-examples:
+              invalidCodeTooShort:
+                summary: Invalid 4-digit code (triggers 422)
+                value:
+                  email: "alice@example.com"
+                  code: "1234"
+              invalidEmptyEmail:
+                summary: Invalid empty email (triggers 422)
+                value:
+                  email: ""
+                  code: "482910"
+              invalidNonNumericCode:
+                summary: Invalid 6-char non-numeric code (triggers 401)
+                value:
+                  email: "alice@example.com"
+                  code: "12ab56"
+              invalidWrongCode:
+                summary: Wrong 6-digit code (triggers 401 and increments attempts)
+                value:
+                  email: "alice@example.com"
+                  code: "000000"
       responses:
         "200":
-          description: Code verified.
+          description: OTP verified. Returns session tokens (`login`) or short-lived signup token (`signup`).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+            Set-Cookie:
+              $ref: "#/components/headers/SetRefreshCookieHeader"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/VerifyCodeResponse"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+              examples:
+                existingUserLogin:
+                  summary: Existing user — login tokens issued
+                  value:
+                    action: "login"
+                    accessToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.access"
+                    refreshToken: "dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g"
+                    access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.access"
+                    refresh_token: "dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g"
+                newUserSignup:
+                  summary: New user — signupToken issued (no Set-Cookie)
+                  value:
+                    action: "signup"
+                    new_user: true
+                    signupToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.signup"
+                    signup_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.signup"
         "401":
-          $ref: "#/components/responses/Unauthorized"
+          description: Invalid/expired/consumed OTP, non-numeric code, disposable email, or >= 5 failed attempts.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidOrExpiredCode:
+                  summary: Wrong, expired, consumed, or non-numeric code
+                  value:
+                    type: "https://api.spill.social/problems/unauthorized"
+                    title: "Unauthorized"
+                    status: 401
+                    detail: "invalid or expired verification code"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                tooManyAttempts:
+                  summary: Locked out after 5 failed attempts
+                  value:
+                    type: "https://api.spill.social/problems/unauthorized"
+                    title: "Unauthorized"
+                    status: 401
+                    detail: "maximum verification attempts exceeded"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
+          description: Malformed JSON, empty email, or `code` length != 6 after trimming.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                malformedJson:
+                  summary: ValidationError - Invalid JSON body
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "invalid request body"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                missingEmailOrCodeLength:
+                  summary: ValidationError - Empty email or code != 6 chars
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "email and 6-digit code are required"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Use `action` (`'login'` | `'signup'`) to route the user either to the home feed or to the onboarding signup form."
+          - "`new_user: true` is present on signup responses and omitted on login responses (`omitempty`)."
+          - "Cookies are only set on `action: 'login'`; `Secure` flag is only set when the server handles TLS directly (`r.TLS != nil`)."
+        qa:
+          - "Precondition: Active unconsumed row in `public.login_codes` created via `/auth/request-code` within `OTP_TTL` (default 10m)."
+          - "Test brute-force limit: 5 wrong codes -> 6th attempt with the *correct* code must still return `401` (`maximum verification attempts exceeded`)."
+          - "Test concurrency: two parallel `POST /auth/verify` calls with the same valid code; only one must succeed (`200`), the other must fail (`401`)."
 
   /auth/signup:
     post:
       operationId: signup
       summary: Complete registration for a new user
       description: |
-        Requires a valid `signupToken` in the Authorization header (obtained from `/auth/verify`).
-        Creates the user account and returns session tokens.
+        Creates a new user account with `role="user"` using the email embedded in the short-lived `signupToken` (validates `purpose="signup"` and HS256 signature), then issues an Access JWT, Refresh Token, and `refresh_token` HttpOnly cookie.
+        The `signupToken` may be sent either in the JSON body (`signupToken` or `signup_token`, which takes precedence) or via `Authorization: Bearer <signupToken>`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Username must match `^[a-z0-9_]{3,20}$` with no leading/trailing `_` and cannot be reserved (`admin`, `root`, `system`, `api`, `support`, `help`, `official`, `moderator`). Birthdate must be `YYYY-MM-DD`, after `1900-01-01`, and age >= 13.
+        - **QA:** Known controller quirk (`auth_controller.go:178`): empty `username` (`""`) or null bytes in `User-Agent` return `ErrInvalidInput` which does not match the 4 explicit sentinel checks in the controller and therefore returns `500` instead of `422`.
       tags: [Auth]
       security:
-        - BearerAuth: []
+        - SignupBearerAuth: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+        - $ref: "#/components/parameters/UserAgentHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/SignupRequest"
+            examples:
+              validMinimalWithHeaderToken:
+                summary: Valid minimal payload (signupToken passed in Authorization header)
+                value:
+                  username: "alice_dev"
+                  displayName: "Alice"
+                  birthdate: "2000-05-15"
+              validFullWithBodyToken:
+                summary: Valid full payload with body signupToken & snake_case support
+                value:
+                  signupToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.signup"
+                  username: "alice_2026"
+                  displayName: "Alice Developer 🌟"
+                  birthdate: "1998-11-26"
+            x-invalid-examples:
+              invalidUnderage:
+                summary: Invalid birthdate — user under 13 years old (triggers 422)
+                value:
+                  signupToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.signup"
+                  username: "young_user"
+                  displayName: "Young User"
+                  birthdate: "2020-01-01"
+              invalidUsernameLeadingUnderscore:
+                summary: Invalid username with leading underscore (triggers 422)
+                value:
+                  signupToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.signup"
+                  username: "_alice"
+                  displayName: "Alice"
+                  birthdate: "2000-01-01"
+              invalidReservedUsername:
+                summary: Invalid reserved username (triggers 422)
+                value:
+                  signupToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.signup"
+                  username: "admin"
+                  displayName: "Admin"
+                  birthdate: "2000-01-01"
+              invalidDuplicateUsername:
+                summary: Existing username conflict (triggers 409)
+                value:
+                  signupToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.signup"
+                  username: "existing_user"
+                  displayName: "Another User"
+                  birthdate: "1995-03-10"
       responses:
         "201":
-          description: User created.
+          description: User account created and session tokens issued.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+            Set-Cookie:
+              $ref: "#/components/headers/SetRefreshCookieHeader"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SignupResponse"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+              examples:
+                created:
+                  summary: Newly registered user
+                  value:
+                    accessToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.access"
+                    refreshToken: "dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g"
+                    access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.access"
+                    refresh_token: "dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g"
+                    user:
+                      id: "550e8400-e29b-41d4-a716-446655440000"
+                      username: "alice_dev"
+                      email: "alice@example.com"
+                      displayName: "Alice"
+                      birthdate: "2000-05-15"
+                      avatarUrl: null
+                      role: "user"
+                      followerCount: 0
+                      followingCount: 0
+                      createdAt: "2026-11-26T15:49:26Z"
         "401":
-          $ref: "#/components/responses/Unauthorized"
+          description: Missing, invalid, expired, or wrong-purpose signup token.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                missingToken:
+                  summary: No signupToken in body or Authorization header
+                  value:
+                    type: "https://api.spill.social/problems/unauthorized"
+                    title: "Unauthorized"
+                    status: 401
+                    detail: "signup token is required"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidSignupToken:
+                  summary: Expired, forged, or access token passed instead of signupToken
+                  value:
+                    type: "https://api.spill.social/problems/unauthorized"
+                    title: "Unauthorized"
+                    status: 401
+                    detail: "invalid signup token: invalid token purpose"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: Username or email already registered.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                usernameTaken:
+                  summary: Conflict - Username already exists
+                  value:
+                    type: "https://api.spill.social/problems/conflict"
+                    title: "Conflict"
+                    status: 409
+                    detail: "username is already taken"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                emailRegistered:
+                  summary: Conflict - Email already registered
+                  value:
+                    type: "https://api.spill.social/problems/conflict"
+                    title: "Conflict"
+                    status: 409
+                    detail: "email is already registered"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+          description: Malformed JSON or validation failure on username, displayName, or birthdate.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                malformedJson:
+                  summary: ValidationError - Malformed JSON
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "invalid request body"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidUsername:
+                  summary: ValidationError - Reserved or invalid username
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: username must be 3-20 characters long and contain only lowercase letters, numbers, and underscores: username is reserved"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidDisplayName:
+                  summary: ValidationError - Empty or > 50 char displayName
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: display name must be between 1 and 50 characters"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidBirthdate:
+                  summary: ValidationError - Bad date format or <= 1900-01-01
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid birthdate format, expected YYYY-MM-DD"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                underage:
+                  summary: ValidationError - User under 13 years old
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: users must be at least 13 years old to sign up"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Client may send `signupToken` either via `Authorization: Bearer <signupToken>` or inside the JSON body; body takes precedence."
+          - "`user.avatarUrl` is always `null` on signup; upload an avatar via `POST /assets` + `PATCH /me` afterward."
+          - "Age calculation uses server UTC/local `time.Now()` against `YYYY-MM-DD`."
+        qa:
+          - "Empty or `null` `username` returns `422` (`ErrInvalidInput` wraps `ErrValidation`)."
+          - "Boundary tests: `birthdate` = exact 13th birthday today (allowed) vs tomorrow-minus-13-years (rejected `422`), `1900-01-01` (rejected) vs `1900-01-02` (allowed), `displayName` 50 emojis (allowed; rune count, not byte length)."
+          - "Note that an Access JWT passed as `signupToken` must be rejected with `401` (`invalid token purpose`)."
 
   /auth/refresh:
     post:
       operationId: refreshTokens
-      summary: Rotate tokens
+      summary: Rotate access and refresh tokens
       description: |
-        Accepts a valid refresh token and returns a new access/refresh token pair.
-        The old refresh token is revoked (rotation).
+        Validates the opaque refresh token from the JSON body (`refreshToken` / `refresh_token`) or the `refresh_token` HttpOnly cookie (body takes precedence), atomically revokes it, and issues a fresh access/refresh token pair.
+        **Reuse Detection:** Presenting an already-revoked refresh token immediately revokes **all** active refresh tokens for that user and returns `401`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Always replace stored `accessToken` and `refreshToken` on `200`. Never retry `/auth/refresh` concurrently with the same token — concurrent rotation triggers reuse detection and invalidates all user sessions.
+        - **QA:** Test reuse detection (send old refresh token twice -> 2nd returns `401` and revokes the newly issued token too). Note: malformed JSON body is silently ignored if the `refresh_token` cookie is present, or returns `422` if neither is supplied.
       tags: [Auth]
-      security: []
+      security:
+        - RefreshCookieAuth: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+        - $ref: "#/components/parameters/UserAgentHeader"
       requestBody:
         required: true
+        description: Required unless the `refresh_token` HttpOnly cookie is present on the request; `{}` without the cookie returns `422`.
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/RefreshRequest"
+            examples:
+              validCamelCase:
+                summary: Valid camelCase body
+                value:
+                  refreshToken: "dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g"
+              validSnakeCase:
+                summary: Valid snake_case body
+                value:
+                  refresh_token: "dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g"
+            x-invalid-examples:
+              validEmptyBodyOnlyWithCookie:
+                summary: Empty object {} (valid ONLY when refresh_token cookie is sent; otherwise 422)
+                value: {}
+              invalidRevokedOrUnknownToken:
+                summary: Unknown, expired, or already-rotated token (triggers 401)
+                value:
+                  refreshToken: "revoked_or_unknown_token_value"
       responses:
         "200":
-          description: Tokens rotated.
+          description: Tokens rotated successfully.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+            Set-Cookie:
+              $ref: "#/components/headers/SetRefreshCookieHeader"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TokenResponse"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+              examples:
+                rotated:
+                  summary: Fresh access and refresh token pair
+                  value:
+                    accessToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.new_access"
+                    refreshToken: "bmV3LXJhbmRvbS0zMi1ieXRlLXJlZnJlc2gtdG9rZW4"
+                    access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.new_access"
+                    refresh_token: "bmV3LXJhbmRvbS0zMi1ieXRlLXJlZnJlc2gtdG9rZW4"
         "401":
-          $ref: "#/components/responses/Unauthorized"
+          description: Refresh token is invalid, expired, revoked, or triggered reuse detection.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidExpiredOrRevoked:
+                  summary: Invalid, expired, or reused token
+                  value:
+                    type: "https://api.spill.social/problems/unauthorized"
+                    title: "Unauthorized"
+                    status: 401
+                    detail: "invalid, expired, or revoked refresh token"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+        "422":
+          description: No refresh token provided in JSON body or `refresh_token` cookie.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                missingRefreshToken:
+                  summary: ValidationError - Missing refresh token
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "refresh token is required"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Single-flight refresh lock in the client is mandatory: parallel calls using the same refresh token will trigger reuse detection and revoke all sessions."
+          - "Malformed JSON is ignored (`_ = json.NewDecoder...`), so sending broken JSON without a cookie returns `422` (`refresh token is required`), not `400`."
+        qa:
+          - "Verify reuse detection: rotate Token A -> Token B; replay Token A -> must return `401`, and subsequent attempt with Token B must also fail with `401`."
 
   /auth/logout:
     post:
       operationId: logout
-      summary: Revoke the refresh token
-      description: Revokes the supplied refresh token, ending the session.
+      summary: Revoke refresh token and clear session cookie
+      description: |
+        Requires a valid Bearer Access JWT (`Authorization: Bearer <accessToken>`).
+        Revokes the refresh token supplied via JSON body (`refreshToken` / `refresh_token`) or the `refresh_token` cookie, clears the `refresh_token` cookie (`MaxAge=-1`), and returns `204 No Content`.
+        Note: Revocation errors (or missing refresh token) are ignored; as long as the Access JWT is valid and any non-empty body is valid JSON, `204` is returned.
+
+        **Team Notes Summary:**
+        - **Front-End:** Must include `Authorization: Bearer <accessToken>`. Clear in-memory access token immediately on `204` (or `401`).
+        - **QA:** Sending empty body with valid Bearer token succeeds with `204` and clears `refresh_token` cookie; sending malformed JSON returns `400`.
       tags: [Auth]
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/LogoutRequest"
+            examples:
+              validWithBodyToken:
+                summary: Valid logout with refreshToken in body
+                value:
+                  refreshToken: "dGhpcy1pcy1hLXJhbmRvbS0zMi1ieXRlLXJlZnJlc2g"
+              validEmptyBody:
+                summary: Valid logout relying on refresh_token cookie (or cookie clear only)
+                value: {}
+            x-invalid-examples:
+              invalidMalformedJson:
+                summary: Non-empty malformed JSON (triggers 400)
+                value: "{bad"
       responses:
         "204":
-          description: Logged out.
+          description: Logged out and `refresh_token` cookie cleared.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+            Set-Cookie:
+              description: Clears `refresh_token` (`MaxAge=-1`).
+              schema:
+                type: string
+              example: "refresh_token=; Path=/auth; Max-Age=0; HttpOnly"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Non-empty request body is malformed JSON or exceeds 1 MiB.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidBody:
+                  summary: BadRequest - Malformed JSON
+                  value:
+                    type: "https://api.spill.social/problems/bad-request"
+                    title: "Bad Request"
+                    status: 400
+                    detail: "invalid request body"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Requires an active Bearer Access JWT. If the access token has already expired, refresh first or clear client state locally."
+          - "If `refreshToken` is omitted from both body and cookie, the server still returns `204` and clears the cookie, though existing DB refresh tokens won't be revoked."
+        qa:
+          - "Verify that after `POST /auth/logout` with a valid refresh token, calling `POST /auth/refresh` with that token fails with `401` and revokes all user tokens (reuse detection)."
 
   # ═══════════════════════════════════════════════════════════
   # USERS
@@ -876,236 +1752,854 @@ paths:
     get:
       operationId: getUserByUsername
       summary: Get a public user profile
+      description: |
+        Fetches a user's public profile by username (`PublicUserResponse` — excludes `email` and `birthdate`).
+        Validates `username` against `^[a-z0-9_]{3,20}$`; invalid username formats fail fast with `404 Not Found` without querying PostgreSQL.
+
+        **Team Notes Summary:**
+        - **Front-End:** Always lowercase usernames before requesting; uppercase letters fail regex validation and return `404`.
+        - **QA:** Test invalid username formats (e.g. `ab`, `Alice`, `user!name`) -> must return `404`, not `422`.
       tags: [Users]
       security: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/UsernameParam"
       responses:
         "200":
-          description: Public profile.
+          description: Public user profile.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PublicUserResponse"
+              examples:
+                withAvatar:
+                  summary: User with avatar
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440000"
+                    username: "alice_dev"
+                    displayName: "Alice"
+                    avatarUrl: "https://project.supabase.co/storage/v1/object/public/media/u/550e8400-e29b-41d4-a716-446655440000/avatar.png"
+                    role: "user"
+                    followerCount: 42
+                    followingCount: 15
+                    createdAt: "2026-10-01T12:00:00Z"
+                withoutAvatar:
+                  summary: User without avatar
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440099"
+                    username: "bob_dev"
+                    displayName: "Bob"
+                    avatarUrl: null
+                    role: "user"
+                    followerCount: 0
+                    followingCount: 0
+                    createdAt: "2026-10-02T09:30:00Z"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Does not return `following` status relative to the caller; check follow state separately if needed."
+          - "Normalize username input to lowercase before calling."
+        qa:
+          - "Assert response never contains `email` or `birthdate`."
+          - "Malformed usernames (`ab`, `USER`, `a-b`) must return `404` per `ValidateGetProfile`."
 
   /me:
     get:
       operationId: getMe
       summary: Get the authenticated user's full profile
-      description: Returns private fields (email, birthdate) that public profiles omit.
+      description: |
+        Returns the caller's full profile (`PrivateUserResponse`), including `email` and `birthdate`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Use this endpoint on app boot / after login to hydrate the current user object.
+        - **QA:** Verify `email` and `birthdate` (`YYYY-MM-DD`) are present; verify `401` on missing/expired JWT.
       tags: [Users]
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
       responses:
         "200":
-          description: Private profile.
+          description: Full private profile of the authenticated user.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PrivateUserResponse"
+              examples:
+                meProfile:
+                  summary: Authenticated user profile
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440000"
+                    username: "alice_dev"
+                    email: "alice@example.com"
+                    displayName: "Alice"
+                    birthdate: "2000-05-15"
+                    avatarUrl: "https://project.supabase.co/storage/v1/object/public/media/u/550e8400-e29b-41d4-a716-446655440000/avatar.png"
+                    role: "user"
+                    followerCount: 42
+                    followingCount: 15
+                    createdAt: "2026-10-01T12:00:00Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: JWT `sub` claim is not a valid non-nil UUID.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidSubUuid:
+                  summary: ValidationError - Malformed userID in token subject
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: userID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Only endpoint (alongside `/auth/signup`) that returns `email` and `birthdate`."
+        qa:
+          - "Verify `404` if a valid JWT references a deleted user UUID."
 
     patch:
       operationId: updateMe
       summary: Update the authenticated user's profile
+      description: |
+        Updates `displayName` and/or `avatarAssetId` for the authenticated user and returns the updated `PrivateUserResponse`.
+        At least one field must be present. Setting `avatarAssetId: null` clears the avatar.
+        A PostgreSQL trigger (`trg_users_avatar_guard`) enforces that a non-null `avatarAssetId` belongs to the caller, has `kind='avatar'`, and has `status='ready'`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Upload and complete an avatar asset (`kind: "avatar"`) via `/assets` and `/assets/{id}/complete` *before* calling `PATCH /me`. Pass `{"avatarAssetId": null}` to remove the avatar.
+        - **QA:** Test passing empty `{}` (`422`), non-ready or `post_image` asset (`422` trigger error), or another user's avatar asset (`422` trigger error).
       tags: [Users]
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/UpdateMeRequest"
+            examples:
+              validMinimalDisplayName:
+                summary: Valid minimal — update displayName only
+                value:
+                  displayName: "Alice Updated"
+              validClearAvatar:
+                summary: Valid — clear existing avatar
+                value:
+                  avatarAssetId: null
+            x-workflow-examples:
+              validFullWithAvatar:
+                summary: Valid full — update displayName and ready avatarAssetId (requires prior POST /assets + /complete)
+                value:
+                  displayName: "Alice ✨"
+                  avatarAssetId: "550e8400-e29b-41d4-a716-446655440002"
+            x-invalid-examples:
+              invalidEmptyObject:
+                summary: Invalid — no mutable fields provided (triggers 422)
+                value: {}
+              invalidDisplayNameTooLong:
+                summary: Invalid — displayName > 50 characters (triggers 422)
+                value:
+                  displayName: "This display name is definitely way longer than fifty characters allowed"
+              invalidAvatarWrongType:
+                summary: Invalid — non-UUID avatarAssetId (triggers 422)
+                value:
+                  avatarAssetId: "not-a-uuid"
+              invalidDisplayNameWrongType:
+                summary: Invalid — numeric displayName (triggers 422)
+                value:
+                  displayName: 12345
       responses:
         "200":
-          description: Updated profile.
+          description: Profile updated.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PrivateUserResponse"
+              examples:
+                updated:
+                  summary: Updated profile response
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440000"
+                    username: "alice_dev"
+                    email: "alice@example.com"
+                    displayName: "Alice ✨"
+                    birthdate: "2000-05-15"
+                    avatarUrl: "https://project.supabase.co/storage/v1/object/public/media/u/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.png"
+                    role: "user"
+                    followerCount: 42
+                    followingCount: 15
+                    createdAt: "2026-10-01T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+          description: Validation error or DB trigger rejection on `avatarAssetId`.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                emptyPayload:
+                  summary: ValidationError - No fields provided
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: at least one field must be provided for update"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidDisplayName:
+                  summary: ValidationError - Display name bounds or control chars
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: display name must be between 1 and 50 characters"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidAvatarUuid:
+                  summary: ValidationError - Malformed avatarAssetId UUID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "avatarAssetId must be a valid UUID format."
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                avatarGuardRejected:
+                  summary: ValidationError - Pending, wrong kind, or unowned avatar asset
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: trigger validation error: avatar 550e8400-e29b-41d4-a716-446655440002 is not a ready avatar owned by this user"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Unknown JSON keys are silently ignored; if ONLY unknown keys are sent, returns `422` (`at least one field must be provided for update`)."
+          - "Passing `{\"displayName\": null}` coerces to empty string in Go `json.Unmarshal` and returns `422`."
+        qa:
+          - "Precondition for avatar test: asset must be `status='ready'`, `kind='avatar'`, and `owner_id=caller`."
+          - "Test `avatarAssetId` with `00000000-0000-0000-0000-000000000000` (nil UUID) -> rejected `422` by service `ValidateUUID`."
 
   /users/{id}/follow:
     put:
       operationId: followUser
       summary: Follow a user
       description: |
-        Idempotent: returns 200 with `{"following": true}` whether the follow
-        was newly created or already existed.
+        Idempotently creates a follow relationship (`INSERT ... ON CONFLICT DO NOTHING`) and returns `{"following": true}`.
+        Database triggers maintain `follower_count` and `following_count` without double-counting on duplicate calls.
+
+        **Team Notes Summary:**
+        - **Front-End:** Safe for optimistic UI and retries. Refresh feed or profile counters after state change.
+        - **QA:** Test self-follow (`422`), nonexistent user UUID (`404`), malformed UUID (`422`), and repeated follow (`200`, `followerCount` increments only once).
       tags: [Users]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/UserIdParam"
       responses:
         "200":
-          description: Current follow state.
+          description: User is now followed (or was already followed).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/FollowStateResponse"
-              example:
-                following: true
+              examples:
+                following:
+                  summary: Following state
+                  value:
+                    following: true
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
-          description: Cannot follow yourself.
+          description: Invalid target user UUID or attempted self-follow.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                selfFollow:
+                  summary: ValidationError - Self-follow prohibited
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "Users cannot follow themselves."
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidUuid:
+                  summary: ValidationError - Malformed target user ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: targetUserID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Idempotent: always returns `200` with `{\"following\": true}`."
+        qa:
+          - "Assert `followerCount` on target and `followingCount` on caller only increment on the first `PUT`, not on repeated calls."
 
     delete:
       operationId: unfollowUser
       summary: Unfollow a user
       description: |
-        Idempotent: returns 200 with `{"following": false}` whether the follow
-        was removed or did not exist.
+        Idempotently deletes a follow relationship and returns `{"following": false}`.
+        Rejects targeting yourself (`422 Users cannot follow themselves.`).
+
+        **Team Notes Summary:**
+        - **Front-End:** Safe to retry; always returns `200` `{"following": false}` if the target user exists.
+        - **QA:** Verify `422` when calling `DELETE /users/{ownId}/follow`, and verify `followerCount` does not drop below `0`.
       tags: [Users]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/UserIdParam"
       responses:
         "200":
-          description: Current follow state.
+          description: User is unfollowed (or was not followed).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/FollowStateResponse"
-              example:
-                following: false
+              examples:
+                unfollowed:
+                  summary: Unfollowed state
+                  value:
+                    following: false
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Invalid target user UUID or attempted self-unfollow.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                selfUnfollow:
+                  summary: ValidationError - Self-unfollow rejected
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "Users cannot follow themselves."
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidUuid:
+                  summary: ValidationError - Malformed target user ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: targetUserID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Idempotent: returns `200` with `{\"following\": false}` even if you were not currently following the target user."
+        qa:
+          - "Note `ValidateUnfollowUser` returns `ErrSelfFollow` when `currentUserID == targetUserID`, yielding `422`."
 
   /users/{id}/followers:
     get:
       operationId: listFollowers
       summary: List a user's followers
+      description: |
+        Returns keyset-paginated followers for the target user, ordered newest-follow-first (`f.created_at DESC, f.follower_id DESC`).
+        Cursor encodes `(edge.createdAt, follower.id)`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Handle `data: null` gracefully as `[]` when a user has 0 followers.
+        - **QA:** Verify cursor pagination across ties in `created_at` and invalid cursor rejection (`422`).
       tags: [Users]
       security: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/UserIdParam"
         - $ref: "#/components/parameters/CursorParam"
         - $ref: "#/components/parameters/LimitParam"
       responses:
         "200":
           description: Paginated list of followers.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/UserListResponse"
+              examples:
+                populatedPage:
+                  summary: Page with followers and nextCursor
+                  value:
+                    data:
+                      - id: "550e8400-e29b-41d4-a716-446655440099"
+                        username: "bob_dev"
+                        displayName: "Bob"
+                        avatarUrl: null
+                        role: "user"
+                        followerCount: 3
+                        followingCount: 10
+                        createdAt: "2026-10-02T09:30:00Z"
+                    pagination:
+                      nextCursor: "MTczMjY0MjIwMDAwMDAwMDo1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwOTk"
+                      limit: 20
+                      hasMore: true
+                emptyPage:
+                  summary: User with 0 followers (nil slice serializes as null)
+                  value:
+                    data: null
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed user UUID or invalid pagination cursor.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidUserUuid:
+                  summary: ValidationError - Malformed user ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: targetUserID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidCursor:
+                  summary: ValidationError - Malformed cursor
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid pagination cursor"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Always normalize `response.data ?? []` because Go's uninitialized slice serializes empty results as `null`."
+        qa:
+          - "Check `limit=0`, `limit=-1`, `limit=abc` (silently uses `20`) and `limit=999` (silently clamped to `50`)."
 
   /users/{id}/following:
     get:
       operationId: listFollowing
       summary: List users this user follows
+      description: |
+        Returns keyset-paginated accounts followed by the target user, ordered newest-follow-first (`f.created_at DESC, f.followee_id DESC`).
+
+        **Team Notes Summary:**
+        - **Front-End:** Handle `data: null` gracefully as `[]` when the user follows nobody.
+        - **QA:** Verify nonexistent user returns `404`, malformed UUID/cursor returns `422`.
       tags: [Users]
       security: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/UserIdParam"
         - $ref: "#/components/parameters/CursorParam"
         - $ref: "#/components/parameters/LimitParam"
       responses:
         "200":
           description: Paginated list of followed users.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/UserListResponse"
+              examples:
+                populatedPage:
+                  summary: Page of followed accounts
+                  value:
+                    data:
+                      - id: "550e8400-e29b-41d4-a716-446655440000"
+                        username: "alice_dev"
+                        displayName: "Alice"
+                        avatarUrl: null
+                        role: "user"
+                        followerCount: 42
+                        followingCount: 15
+                        createdAt: "2026-10-01T12:00:00Z"
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
+                emptyPage:
+                  summary: Empty following list (data is null)
+                  value:
+                    data: null
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed user UUID or invalid pagination cursor.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidUserUuid:
+                  summary: ValidationError - Malformed user ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: targetUserID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidCursor:
+                  summary: ValidationError - Malformed cursor
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid pagination cursor"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Normalize `response.data ?? []` for empty lists."
+        qa:
+          - "Verify `cursor` contains the `follow_edges.created_at` timestamp, not `users.created_at`."
 
   # ═══════════════════════════════════════════════════════════
-  # POSTS
+  # POSTS & FEED
   # ═══════════════════════════════════════════════════════════
 
   /posts:
     post:
       operationId: createPost
       summary: Create a new post
+      description: |
+        Creates a post with optional text (`body`, max 2000 runes) and optional image attachments (`assetIds`, max 4 unique UUIDs).
+        At least one of non-whitespace `body` or non-empty `assetIds` is required.
+        A database trigger (`trg_post_assets_guard`) verifies inside the transaction that every attached asset exists, is owned by the author, has `kind='post_image'`, and has `status='ready'`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Conditional rule: `body` can be omitted/empty **only** when `assetIds` contains 1–4 completed (`ready`) `post_image` asset IDs. Maximum is **4** images per post (not 10).
+        - **QA:** Test image-only post (empty `body`, 1 asset), text-only post, 4-image post, 5-image post (`422`), duplicate asset ID (`422`), and attaching a missing/pending/avatar/already-attached/someone-else's asset (`422`).
       tags: [Posts]
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/CreatePostRequest"
+            examples:
+              validMinimalTextOnly:
+                summary: Valid minimal — text-only post
+                value:
+                  body: "Hello Spill!"
+              validMultilineTextOnly:
+                summary: Valid full — multiline text post
+                value:
+                  body: "Shipping our API docs today!\nCheck out the architecture diagrams."
+            x-workflow-examples:
+              validMinimalImageOnly:
+                summary: Valid minimal — image-only post (requires pre-completed assetId from POST /assets + /complete)
+                value:
+                  assetIds:
+                    - "550e8400-e29b-41d4-a716-446655440002"
+              validFullTextAndImages:
+                summary: Valid full — multiline text and 2 images (requires pre-completed assetIds)
+                value:
+                  body: "Shipping our API docs today!\nCheck out the architecture diagrams."
+                  assetIds:
+                    - "550e8400-e29b-41d4-a716-446655440002"
+                    - "550e8400-e29b-41d4-a716-446655440004"
+            x-invalid-examples:
+              invalidEmptyBodyNoAssets:
+                summary: Invalid — whitespace body and no assets (triggers 422)
+                value:
+                  body: "   "
+                  assetIds: []
+              invalidTooManyAssets:
+                summary: Invalid — 5 images exceeds max of 4 (triggers 422)
+                value:
+                  body: "Too many images"
+                  assetIds:
+                    - "550e8400-e29b-41d4-a716-446655440001"
+                    - "550e8400-e29b-41d4-a716-446655440002"
+                    - "550e8400-e29b-41d4-a716-446655440003"
+                    - "550e8400-e29b-41d4-a716-446655440004"
+                    - "550e8400-e29b-41d4-a716-446655440005"
+              invalidDuplicateAssets:
+                summary: Invalid — duplicate assetId (triggers 422)
+                value:
+                  body: "Duplicate"
+                  assetIds:
+                    - "550e8400-e29b-41d4-a716-446655440002"
+                    - "550e8400-e29b-41d4-a716-446655440002"
       responses:
         "201":
           description: Post created.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PostResponse"
+              examples:
+                createdWithAssets:
+                  summary: Created post with author and assets
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440010"
+                    authorId: "550e8400-e29b-41d4-a716-446655440000"
+                    author:
+                      id: "550e8400-e29b-41d4-a716-446655440000"
+                      username: "alice_dev"
+                      displayName: "Alice"
+                      avatarUrl: null
+                      role: "user"
+                      followerCount: 42
+                      followingCount: 15
+                      createdAt: "2026-10-01T12:00:00Z"
+                    body: "Shipping our API docs today!\nCheck out the architecture diagrams."
+                    assets:
+                      - id: "550e8400-e29b-41d4-a716-446655440002"
+                        url: "https://project.supabase.co/storage/v1/object/public/media/u/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.png"
+                        mimeType: "image/png"
+                        sizeBytes: 204800
+                        status: "ready"
+                    likeCount: 0
+                    commentCount: 0
+                    shareCount: 0
+                    liked: false
+                    createdAt: "2026-11-26T15:49:26Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+          description: Validation error or PostgreSQL asset trigger rejection.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                emptyBodyAndAssets:
+                  summary: ValidationError - Neither body nor assets provided
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: post must have body text or at least one image"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                tooManyAssets:
+                  summary: ValidationError - More than 4 images
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: posts cannot have more than 4 images"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                assetNotReadyOrOwned:
+                  summary: ValidationError - Trigger rejected pending/unowned/avatar asset
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: asset 550e8400-e29b-41d4-a716-446655440002 must be a ready post_image"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Upload and complete images (`kind='post_image'`) before submitting `POST /posts`."
+          - "`body` preserves leading/trailing whitespace and newlines (`\\t`, `\\n`, `\\r`); only pure-whitespace without assets is rejected."
+        qa:
+          - "Boundary: exactly 2000 Unicode runes in `body` (accepted) vs 2001 runes (rejected `422`)."
+          - "Non-existent (`23503`), already-attached (`23505`), or trigger-rejected (`P0001`) `assetIds` all map to `422 Unprocessable Entity`."
 
   /posts/{id}:
     get:
       operationId: getPost
       summary: Get a single post
+      description: |
+        Fetches a single non-deleted post with embedded author, ordered assets, and engagement counts.
+        Uses `OptionalAuth`: `liked` is `true`/`false` if a valid Bearer JWT is supplied, or `null` for anonymous/invalid-token callers.
+
+        **Team Notes Summary:**
+        - **Front-End:** Note that `liked: null` indicates anonymous state (not `false`).
+        - **QA:** Verify soft-deleted posts return `404`, invalid UUIDs return `422`, and an expired/corrupt `Authorization` header does NOT return `401` (degrades gracefully to `liked: null`).
       tags: [Posts]
-      security: []
+      security:
+        - {}
+        - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/PostIdParam"
       responses:
         "200":
           description: The post.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PostResponse"
+              examples:
+                authenticatedView:
+                  summary: Authenticated caller (liked is boolean)
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440010"
+                    authorId: "550e8400-e29b-41d4-a716-446655440000"
+                    author:
+                      id: "550e8400-e29b-41d4-a716-446655440000"
+                      username: "alice_dev"
+                      displayName: "Alice"
+                      avatarUrl: null
+                      role: "user"
+                      followerCount: 42
+                      followingCount: 15
+                      createdAt: "2026-10-01T12:00:00Z"
+                    body: "Hello Spill!"
+                    assets: []
+                    likeCount: 12
+                    commentCount: 3
+                    shareCount: 1
+                    liked: true
+                    createdAt: "2026-11-26T15:49:26Z"
+                anonymousView:
+                  summary: Anonymous caller (liked is null)
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440010"
+                    authorId: "550e8400-e29b-41d4-a716-446655440000"
+                    author:
+                      id: "550e8400-e29b-41d4-a716-446655440000"
+                      username: "alice_dev"
+                      displayName: "Alice"
+                      avatarUrl: null
+                      role: "user"
+                      followerCount: 42
+                      followingCount: 15
+                      createdAt: "2026-10-01T12:00:00Z"
+                    body: "Hello Spill!"
+                    assets: []
+                    likeCount: 12
+                    commentCount: 3
+                    shareCount: 1
+                    liked: null
+                    createdAt: "2026-11-26T15:49:26Z"
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed post UUID.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidPostUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Uses `OptionalAuth`; prompt login if user taps Like when `liked === null`."
+        qa:
+          - "Verify invalid/expired Bearer token on `GET /posts/{id}` still returns `200` with `liked: null`."
 
     patch:
       operationId: updatePost
-      summary: Edit a post
-      description: Only the post author (or an admin) may edit.
+      summary: Edit a post's text body
+      description: |
+        Updates the `body` of a non-deleted post and sets `edited_at = now()` in the database (not exposed in `PostResponse`).
+        Authorization: Only the post author OR an `admin` role user may edit (`403` otherwise).
+
+        **Team Notes Summary:**
+        - **Front-End:** Attachments cannot be modified via `PATCH /posts/{id}`; `body` must be non-whitespace (1–2000 runes) even if the post has attached images.
+        - **QA:** Test author edit (`200`), admin edit (`200`), other user edit (`403`), soft-deleted post (`404`), and empty body on image post (`422`).
       tags: [Posts]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/PostIdParam"
       requestBody:
         required: true
@@ -1113,13 +2607,52 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/UpdatePostRequest"
+            examples:
+              validUpdate:
+                summary: Valid body update
+                value:
+                  body: "Updated post content!"
+            x-invalid-examples:
+              invalidEmptyBody:
+                summary: Invalid empty/whitespace body (triggers 422)
+                value:
+                  body: "   "
+              invalidTooLong:
+                summary: Invalid body > 2000 runes (triggers 422)
+                value:
+                  body: "<string exceeding 2000 runes>"
       responses:
         "200":
           description: Post updated.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PostResponse"
+              examples:
+                updated:
+                  summary: Updated post response
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440010"
+                    authorId: "550e8400-e29b-41d4-a716-446655440000"
+                    author:
+                      id: "550e8400-e29b-41d4-a716-446655440000"
+                      username: "alice_dev"
+                      displayName: "Alice"
+                      avatarUrl: null
+                      role: "user"
+                      followerCount: 42
+                      followingCount: 15
+                      createdAt: "2026-10-01T12:00:00Z"
+                    body: "Updated post content!"
+                    assets: []
+                    likeCount: 12
+                    commentCount: 3
+                    shareCount: 1
+                    liked: false
+                    createdAt: "2026-11-26T15:49:26Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1129,75 +2662,286 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+          description: Invalid post UUID, invalid JWT role, or invalid post body.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                emptyBody:
+                  summary: ValidationError - Empty post body
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: post body cannot be empty"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Unlike `POST /posts`, `PATCH /posts/{id}` always requires a non-whitespace `body` (1–2000 chars)."
+          - "Note that `editedAt` is stored in DB but is not returned in `PostResponse`."
+        qa:
+          - "Check RBAC: verify `role='admin'` can edit another user's post while `role='user'` receives `403`."
 
     delete:
       operationId: deletePost
       summary: Soft-delete a post
-      description: Only the post author (or an admin) may delete.
+      description: |
+        Sets `deleted_at = now()` on the post.
+        Authorization: Only the post author OR an `admin` role user may delete (`403` otherwise).
+
+        **Team Notes Summary:**
+        - **Front-End:** Optimistically remove post from feed/profile caches on `204`.
+        - **QA:** Subsequent `GET /posts/{id}`, `PATCH /posts/{id}`, `DELETE /posts/{id}`, likes, comments, and shares on this post must all return `404`.
       tags: [Posts]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/PostIdParam"
       responses:
         "204":
-          description: Post deleted.
+          description: Post soft-deleted.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed post UUID or invalid role claim.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidPostUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Soft delete only; attached `assets` rows remain in `public.assets` and are not deleted."
+        qa:
+          - "Verify deleting an already soft-deleted post returns `404`, not `204`."
 
   /feed:
     get:
       operationId: getFeed
       summary: Get the authenticated user's home feed
-      description: Posts from followed users, keyset-paginated by (createdAt, id).
+      description: |
+        Returns keyset-paginated posts written by users the authenticated caller follows, ordered newest-first (`p.created_at DESC, p.id DESC`).
+        `liked` is always a boolean (`true`/`false`).
+
+        **Team Notes Summary:**
+        - **Front-End:** Feed includes **followed users' posts only** (does not include the caller's own posts). Normalize `data ?? []` when empty.
+        - **QA:** Verify own posts do not appear in `/feed` (since self-follow is blocked), soft-deleted posts are excluded, and `cursor` paginates cleanly without duplicates.
       tags: [Feed]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/CursorParam"
         - $ref: "#/components/parameters/LimitParam"
       responses:
         "200":
-          description: Paginated feed.
+          description: Paginated home feed.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PostListResponse"
+              examples:
+                populatedFeed:
+                  summary: Feed page with posts
+                  value:
+                    data:
+                      - id: "550e8400-e29b-41d4-a716-446655440010"
+                        authorId: "550e8400-e29b-41d4-a716-446655440099"
+                        author:
+                          id: "550e8400-e29b-41d4-a716-446655440099"
+                          username: "bob_dev"
+                          displayName: "Bob"
+                          avatarUrl: null
+                          role: "user"
+                          followerCount: 3
+                          followingCount: 10
+                          createdAt: "2026-10-02T09:30:00Z"
+                        body: "Hello from Bob!"
+                        assets: []
+                        likeCount: 1
+                        commentCount: 0
+                        shareCount: 0
+                        liked: true
+                        createdAt: "2026-11-26T15:40:00Z"
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
+                emptyFeed:
+                  summary: Empty feed (data is null)
+                  value:
+                    data: null
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: Invalid pagination cursor or invalid `sub` UUID in JWT.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidCursor:
+                  summary: ValidationError - Malformed cursor
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid pagination cursor"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Follows-only feed: user's own posts appear on `/users/{myId}/posts`, not `/feed`."
+          - "Normalize `response.data ?? []` for new users following nobody."
+        qa:
+          - "Verify `cursor` with invalid base64 or non-UUID ID returns `422`."
 
   /users/{id}/posts:
     get:
       operationId: listUserPosts
-      summary: List posts by a specific user
+      summary: List posts authored by a specific user
+      description: |
+        Returns keyset-paginated non-deleted posts by user `{id}`, ordered newest-first (`p.created_at DESC, p.id DESC`).
+        Uses `OptionalAuth`: `liked` is boolean if authenticated, `null` otherwise.
+
+        **Team Notes Summary:**
+        - **Front-End:** Handle `data: null` as `[]`. `liked` is `null` when unauthenticated.
+        - **QA:** Verify nonexistent user UUID returns `404`, invalid UUID or cursor returns `422`.
       tags: [Posts]
-      security: []
+      security:
+        - {}
+        - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/UserIdParam"
         - $ref: "#/components/parameters/CursorParam"
         - $ref: "#/components/parameters/LimitParam"
       responses:
         "200":
-          description: Paginated posts.
+          description: Paginated list of user posts.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PostListResponse"
+              examples:
+                userPosts:
+                  summary: User has posts
+                  value:
+                    data:
+                      - id: "550e8400-e29b-41d4-a716-446655440010"
+                        authorId: "550e8400-e29b-41d4-a716-446655440000"
+                        author:
+                          id: "550e8400-e29b-41d4-a716-446655440000"
+                          username: "alice_dev"
+                          displayName: "Alice"
+                          avatarUrl: null
+                          role: "user"
+                          followerCount: 42
+                          followingCount: 15
+                          createdAt: "2026-10-01T12:00:00Z"
+                        body: "Hello Spill!"
+                        assets: []
+                        likeCount: 5
+                        commentCount: 2
+                        shareCount: 0
+                        liked: null
+                        createdAt: "2026-11-26T15:40:00Z"
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
+                noPosts:
+                  summary: User has 0 posts (data is null)
+                  value:
+                    data: null
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed user UUID or invalid pagination cursor.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidUserUuid:
+                  summary: ValidationError - Malformed user ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: targetUserID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidCursor:
+                  summary: ValidationError - Malformed cursor
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid pagination cursor"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Normalize `response.data ?? []` when user has zero posts."
+        qa:
+          - "Verify soft-deleted posts do not appear and do not break cursor pagination."
 
   # ═══════════════════════════════════════════════════════════
   # INTERACTIONS
@@ -1208,61 +2952,139 @@ paths:
       operationId: likePost
       summary: Like a post
       description: |
-        Idempotent: returns 200 with `{"liked": true}` whether the like
-        was newly created or already existed.
+        Idempotently records a like (`INSERT ... ON CONFLICT DO NOTHING`) and returns `{"liked": true}`.
+        Database trigger `trg_likes_counter` increments `like_count` only when a new row is inserted.
+
+        **Team Notes Summary:**
+        - **Front-End:** Idempotent; safe for optimistic UI toggles.
+        - **QA:** Verify repeated `PUT` calls return `200` and increment `likeCount` only once; soft-deleted posts return `404`.
       tags: [Interactions]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/PostIdParam"
       responses:
         "200":
           description: Current like state.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/LikeStateResponse"
-              example:
-                liked: true
+              examples:
+                liked:
+                  summary: Post liked
+                  value:
+                    liked: true
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed post UUID.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidPostUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Idempotent `PUT`; no request body needed."
+        qa:
+          - "Test concurrent `PUT /posts/{id}/like` from the same user -> `likeCount` must equal `1`."
 
     delete:
       operationId: unlikePost
       summary: Unlike a post
+      description: |
+        Idempotently removes a like and returns `{"liked": false}`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Idempotent; safe to call even if already unliked.
+        - **QA:** Verify `likeCount` never drops below `0` and soft-deleted posts return `404`.
       tags: [Interactions]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/PostIdParam"
       responses:
         "200":
           description: Current like state.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/LikeStateResponse"
-              example:
-                liked: false
+              examples:
+                unliked:
+                  summary: Post unliked
+                  value:
+                    liked: false
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed post UUID.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidPostUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Returns `200` (not `204`) with `{\"liked\": false}`."
+        qa:
+          - "Test unliking a post the user never liked -> `200` `{\"liked\": false}` and `likeCount` unchanged."
 
   /posts/{id}/share:
     post:
       operationId: sharePost
-      summary: Share a post (optional quote)
+      summary: Share a post (with optional quote)
+      description: |
+        Shares a non-deleted post with an optional `quote` (up to 500 Unicode runes). An empty request body is valid.
+        **Upsert Semantics:** Unique constraint `(user_id, post_id)` allows at most one share per user per post. Repeating `POST /posts/{id}/share` updates `quote = COALESCE(EXCLUDED.quote, shares.quote)` and still returns `201 Created` without incrementing `share_count` again.
+
+        **Team Notes Summary:**
+        - **Front-End:** Only one share per user per post exists; re-sharing with a new non-null `quote` updates the quote in place (`201`), whereas re-sharing with `quote: null` or empty body preserves the prior quote.
+        - **QA:** Test empty body (`201`), `quote` > 500 runes (`422`), re-share with updated quote (`201`, `shareCount` stays `1`), and malformed JSON (`400`).
       tags: [Interactions]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/PostIdParam"
       requestBody:
         required: false
@@ -1270,63 +3092,49 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CreateShareRequest"
+            examples:
+              validMinimalEmptyBody:
+                summary: Valid minimal — empty object (simple repost)
+                value: {}
+              validFullWithQuote:
+                summary: Valid full — share with quote commentary
+                value:
+                  quote: "Must-read thread on Go architecture!"
+            x-invalid-examples:
+              invalidQuoteTooLong:
+                summary: Invalid — quote > 500 runes (triggers 422)
+                value:
+                  quote: "<string exceeding 500 Unicode characters>"
+              invalidMalformedJson:
+                summary: Invalid — malformed JSON (triggers 400)
+                value: "{quote:"
       responses:
         "201":
-          description: Share created.
+          description: Share created (or existing share updated).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ShareResponse"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalServerError"
-
-  /posts/{id}/comments:
-    get:
-      operationId: listComments
-      summary: List comments on a post
-      tags: [Interactions]
-      security: []
-      parameters:
-        - $ref: "#/components/parameters/PostIdParam"
-        - $ref: "#/components/parameters/CursorParam"
-        - $ref: "#/components/parameters/LimitParam"
-      responses:
-        "200":
-          description: Paginated comments.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CommentListResponse"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalServerError"
-
-    post:
-      operationId: createComment
-      summary: Add a comment to a post
-      tags: [Interactions]
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/PostIdParam"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateCommentRequest"
-      responses:
-        "201":
-          description: Comment created.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CommentResponse"
+              examples:
+                plainShare:
+                  summary: Simple share without quote
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440020"
+                    userId: "550e8400-e29b-41d4-a716-446655440000"
+                    postId: "550e8400-e29b-41d4-a716-446655440010"
+                    quote: null
+                    createdAt: "2026-11-26T15:49:26Z"
+                quoteShare:
+                  summary: Share with quote
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440020"
+                    userId: "550e8400-e29b-41d4-a716-446655440000"
+                    postId: "550e8400-e29b-41d4-a716-446655440010"
+                    quote: "Must-read thread on Go architecture!"
+                    createdAt: "2026-11-26T15:49:26Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1334,31 +3142,304 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+          description: Malformed post UUID or `quote` validation failure (> 500 runes or control chars).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                quoteTooLong:
+                  summary: ValidationError - Quote > 500 characters
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: quote must not exceed 500 characters"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidPostUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "One share per user per post. Re-sharing with `quote: null` preserves the existing quote; passing `quote: \"\"` overwrites it with empty string."
+        qa:
+          - "Test boundary: 500 Unicode runes (allowed) vs 501 runes (`422`)."
+          - "Verify `shareCount` increments only once on repeated shares by the same user."
+
+  /posts/{id}/comments:
+    get:
+      operationId: listComments
+      summary: List comments on a post
+      description: |
+        Returns keyset-paginated non-deleted comments for a non-deleted post, ordered **chronologically ascending** (`c.created_at ASC, c.id ASC`).
+
+        **Team Notes Summary:**
+        - **Front-End:** Comments are returned oldest-first (`ASC`), unlike feeds and follower lists (`DESC`). Normalize `data ?? []`.
+        - **QA:** Verify soft-deleted parent post returns `404`, soft-deleted comments are excluded, and `ASC` cursor pagination works cleanly.
+      tags: [Interactions]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+        - $ref: "#/components/parameters/PostIdParam"
+        - $ref: "#/components/parameters/CursorParam"
+        - $ref: "#/components/parameters/LimitParam"
+      responses:
+        "200":
+          description: Paginated list of comments (chronological ascending).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommentListResponse"
+              examples:
+                populatedComments:
+                  summary: Page of comments
+                  value:
+                    data:
+                      - id: "550e8400-e29b-41d4-a716-446655440003"
+                        postId: "550e8400-e29b-41d4-a716-446655440010"
+                        authorId: "550e8400-e29b-41d4-a716-446655440099"
+                        author:
+                          id: "550e8400-e29b-41d4-a716-446655440099"
+                          username: "bob_dev"
+                          displayName: "Bob"
+                          avatarUrl: null
+                          role: "user"
+                          followerCount: 3
+                          followingCount: 10
+                          createdAt: "2026-10-02T09:30:00Z"
+                        body: "Great post!"
+                        createdAt: "2026-11-26T15:45:00Z"
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
+                noComments:
+                  summary: Post with 0 comments (data is null)
+                  value:
+                    data: null
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed post UUID or invalid pagination cursor.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidPostUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidCursor:
+                  summary: ValidationError - Malformed cursor
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid pagination cursor"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Sorted oldest-first (`ASC`), so appending paginated pages places newer replies at the bottom."
+          - "Normalize `response.data ?? []` when empty."
+        qa:
+          - "Ensure soft-deleted comments are omitted without creating gaps in cursor pagination."
+
+    post:
+      operationId: createComment
+      summary: Add a comment to a post
+      description: |
+        Creates a comment (1–1000 Unicode runes) on a non-deleted post and increments `post.comment_count` via DB trigger `trg_comments_counter_row`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Actual max length is **1000** characters (not 500). Increment local `commentCount` on `201`.
+        - **QA:** Boundary test 1000 runes (`201`) vs 1001 runes (`422`), whitespace-only (`422`), and commenting on a soft-deleted post (`404`).
+      tags: [Interactions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+        - $ref: "#/components/parameters/PostIdParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCommentRequest"
+            examples:
+              validMinimal:
+                summary: Valid minimal comment
+                value:
+                  body: "Nice!"
+              validFullMultiline:
+                summary: Valid multiline comment with Unicode
+                value:
+                  body: "Line 1: Really helpful breakdown.\nLine 2: Thanks for sharing! 🚀"
+            x-invalid-examples:
+              invalidWhitespaceOnly:
+                summary: Invalid whitespace-only body (triggers 422)
+                value:
+                  body: "   \n\t  "
+              invalidTooLong:
+                summary: Invalid body > 1000 runes (triggers 422)
+                value:
+                  body: "<string exceeding 1000 Unicode runes>"
+      responses:
+        "201":
+          description: Comment created.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommentResponse"
+              examples:
+                created:
+                  summary: Created comment with embedded author
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440003"
+                    postId: "550e8400-e29b-41d4-a716-446655440010"
+                    authorId: "550e8400-e29b-41d4-a716-446655440000"
+                    author:
+                      id: "550e8400-e29b-41d4-a716-446655440000"
+                      username: "alice_dev"
+                      displayName: "Alice"
+                      avatarUrl: null
+                      role: "user"
+                      followerCount: 42
+                      followingCount: 15
+                      createdAt: "2026-10-01T12:00:00Z"
+                    body: "Nice!"
+                    createdAt: "2026-11-26T15:49:26Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed post UUID or comment body validation error.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                emptyBody:
+                  summary: ValidationError - Empty or whitespace-only comment
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: comment body must not be empty"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                tooLong:
+                  summary: ValidationError - Exceeds 1000 characters
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: comment body must be between 1 and 1000 characters"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidPostUuid:
+                  summary: ValidationError - Malformed post ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: postID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Actual backend cap is `1000` runes (`ValidateCreateComment` and DB `comments_body_len` check)."
+        qa:
+          - "Test `trg_comments_counter_row` increments parent `posts.comment_count` on `201`."
 
   /comments/{id}:
     delete:
       operationId: deleteComment
       summary: Soft-delete a comment
-      description: Only the comment author (or an admin) may delete.
+      description: |
+        Sets `deleted_at = now()` on the comment, triggering `trg_comments_counter_softdelete` to decrement the parent post's `comment_count`.
+        Authorization: Only the comment author OR an `admin` role user may delete (`403` otherwise).
+
+        **Team Notes Summary:**
+        - **Front-End:** Optimistically remove comment and decrement post `commentCount` on `204`.
+        - **QA:** Deleting an already soft-deleted comment returns `404`; non-author non-admin returns `403`.
       tags: [Interactions]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/CommentIdParam"
       responses:
         "204":
-          description: Comment deleted.
+          description: Comment soft-deleted.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: Malformed comment UUID or invalid role claim.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                invalidCommentUuid:
+                  summary: ValidationError - Malformed comment ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: commentID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Returns `204 No Content`."
+        qa:
+          - "Verify parent post `commentCount` decrements by 1 on first delete, and second delete returns `404` without further decrement."
 
   # ═══════════════════════════════════════════════════════════
   # ASSETS
@@ -1369,55 +3450,171 @@ paths:
       operationId: createAsset
       summary: Request a presigned upload URL
       description: |
-        Validates the MIME type and size, creates a pending asset row,
-        and returns a presigned PUT URL for the client to upload directly
-        to object storage.
+        Creates a `pending` asset record (`upload_expires_at = now() + 1 hour`) and requests a signed PUT URL from Supabase Storage (`/storage/v1/object/upload/sign/{bucket}/{key}`).
+        A background cleanup goroutine purges expired `pending` assets and their storage objects every 5 minutes.
+
+        **Team Notes Summary:**
+        - **Front-End:** Upload workflow is 3 steps: (1) `POST /assets`, (2) HTTP `PUT` raw bytes directly to `presignedPutUrl` with matching `Content-Type`, (3) `POST /assets/{assetId}/complete`. Specify `kind: "avatar"` for profile avatars (defaults to `"post_image"`).
+        - **QA:** Note status split: `sizeBytes > 5242880` returns `413 Payload Too Large`, while `sizeBytes < 1` returns `422 Unprocessable Entity`. Requires Supabase Storage mock or live instance.
       tags: [Assets]
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/CreateAssetRequest"
+            examples:
+              validMinimalPostImage:
+                summary: Valid minimal (kind defaults to post_image)
+                value:
+                  mimeType: "image/png"
+                  sizeBytes: 204800
+              validFullAvatar:
+                summary: Valid full — avatar asset at 5 MiB boundary
+                value:
+                  mimeType: "image/webp"
+                  sizeBytes: 5242880
+                  kind: "avatar"
+            x-invalid-examples:
+              invalidOver5MB:
+                summary: Invalid — exceeds 5 MiB (triggers 413)
+                value:
+                  mimeType: "image/jpeg"
+                  sizeBytes: 5242881
+              invalidZeroBytes:
+                summary: Invalid — 0 bytes (triggers 422)
+                value:
+                  mimeType: "image/png"
+                  sizeBytes: 0
+              invalidMimeType:
+                summary: Invalid — unsupported MIME type (triggers 422)
+                value:
+                  mimeType: "image/gif"
+                  sizeBytes: 10240
+              invalidKind:
+                summary: Invalid — unknown kind (triggers 422)
+                value:
+                  mimeType: "image/png"
+                  sizeBytes: 10240
+                  kind: "video"
       responses:
         "201":
-          description: Asset record created; use the presigned URL to upload.
+          description: Pending asset created and presigned upload URL issued.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateAssetResponse"
+              examples:
+                created:
+                  summary: Asset ID and signed upload URL
+                  value:
+                    assetId: "550e8400-e29b-41d4-a716-446655440002"
+                    presignedPutUrl: "https://project.supabase.co/storage/v1/object/upload/sign/media/u/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.png?token=signed"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "413":
-          $ref: "#/components/responses/PayloadTooLarge"
+          description: "`sizeBytes` exceeds 5,242,880 bytes (5 MiB)."
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                exceedsMaxBytes:
+                  summary: PayloadTooLarge - sizeBytes > 5242880
+                  value:
+                    type: "https://api.spill.social/problems/payload-too-large"
+                    title: "Payload Too Large"
+                    status: 413
+                    detail: "payload too large: asset size must not exceed 5 242 880 bytes (5 MB)"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+          description: Validation error on `sizeBytes < 1`, `mimeType`, or `kind`.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                sizeTooSmall:
+                  summary: ValidationError - sizeBytes < 1
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: asset size must be at least 1 byte"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                unsupportedMime:
+                  summary: ValidationError - Unsupported mimeType
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: unsupported mime type image/gif (allowed: image/jpeg, image/png, image/webp)"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidKind:
+                  summary: ValidationError - Invalid kind
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid kind video"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Send the exact `file.size` (in bytes) as `sizeBytes`: `/complete` verifies the uploaded object's byte size matches `sizeBytes`."
+          - "Must call `/assets/{id}/complete` within 1 hour before the background cleanup job purges the pending record."
+        qa:
+          - "External dependency: calls Supabase Storage `POST /storage/v1/object/upload/sign/{bucket}/{key}`; if Supabase returns non-200, API returns `500` while leaving a pending DB row (cleaned up later)."
+          - "Boundary tests: `sizeBytes = 1`, `5242880` (`201`), `5242881` (`413`), `0` (`422`), `-1` (`422`)."
 
   /assets/{id}/complete:
     post:
       operationId: completeAsset
       summary: Mark an asset upload as complete
       description: |
-        The server verifies the object exists in storage (HEAD) and transitions
-        the asset status from `pending` to `ready`.
+        Verifies ownership (owner or `admin`), checks the asset is still `pending` (`409` if already `ready`), queries Supabase Storage `/storage/v1/object/info/{bucket}/{key}` to verify the object exists and its size equals `asset.size_bytes` (`422` if missing or size mismatch), and transitions `status` to `ready`.
+
+        **Team Notes Summary:**
+        - **Front-End:** Only after this returns `200` can the `assetId` be attached to `POST /posts` or `PATCH /me`.
+        - **QA:** Verify missing object in storage (`422`), uploaded size mismatch (`422`), already completed (`409`), wrong owner (`403`), and missing asset (`404`).
       tags: [Assets]
       security:
         - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - $ref: "#/components/parameters/AssetIdParam"
       responses:
         "200":
-          description: Asset is ready.
+          description: Asset verified and marked `ready`.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompleteAssetResponse"
+              examples:
+                completed:
+                  summary: Ready asset with public URL
+                  value:
+                    assetId: "550e8400-e29b-41d4-a716-446655440002"
+                    url: "https://project.supabase.co/storage/v1/object/public/media/u/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.png"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1425,13 +3622,64 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Asset is already marked as ready.
+          description: Asset is already marked as `ready`.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                alreadyReady:
+                  summary: Conflict - Asset already completed
+                  value:
+                    type: "https://api.spill.social/problems/conflict"
+                    title: "Conflict"
+                    status: 409
+                    detail: "Asset is already marked as ready."
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+        "422":
+          description: Invalid asset UUID, missing storage object, size mismatch, or storage verification error.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                objectNotFoundInStorage:
+                  summary: ValidationError - File was never PUT to presignedPutUrl
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: storage object not found in bucket"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                sizeMismatch:
+                  summary: ValidationError - Uploaded byte size differs from declared sizeBytes
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: uploaded size does not match expected size"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidAssetUuid:
+                  summary: ValidationError - Malformed asset ID
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: assetID must be a valid non-nil UUID"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "Calling `/complete` twice returns `409`; treat `409` idempotently on retry if the client already knows the assetId, or avoid double-submitting."
+        qa:
+          - "Note that `VerifyObject` failures (including Supabase upstream errors) are wrapped in `ErrValidation` and return `422`, not `500` or `502`."
 
   # ═══════════════════════════════════════════════════════════
   # SEARCH
@@ -1440,37 +3688,178 @@ paths:
   /search:
     get:
       operationId: search
-      summary: Full-text search across users, posts, or comments
+      summary: Search users, posts, or comments
+      description: |
+        Performs search across one entity type at a time:
+        - `users`: Username prefix match (`lower(q)%`) OR `websearch_to_tsquery('simple', q)` on `display_name`, ordered by `created_at DESC`.
+        - `posts`: `websearch_to_tsquery('english', q)` on `body` (non-deleted), ordered by `ts_rank DESC, created_at DESC`.
+        - `comments`: `websearch_to_tsquery('english', q)` on `body` (non-deleted), ordered by `ts_rank DESC, created_at DESC`.
+
+        Uses `OptionalAuth`: when `type=posts` and a valid Bearer JWT is supplied, `liked` is boolean (`true`/`false`); otherwise `null`.
+        Unlike keyset endpoints, `GET /search` uses an **offset** `cursor` and always returns `data: []` (non-null) when empty.
+
+        **Team Notes Summary:**
+        - **Front-End:** `type` must be exact lowercase (`users`, `posts`, `comments`). Both `q` and `type` are required. `data` is guaranteed to be an array (`[]` when empty).
+        - **QA:** Test missing `q` (`422`), missing/invalid `type` (`422`), `q` > 200 runes (`422`), negative/invalid `cursor` (`422`), and empty results (`200` with `"data": []`).
       tags: [Search]
-      security: []
+      security:
+        - {}
+        - BearerAuth: []
       parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
         - name: q
           in: query
           required: true
-          description: Search query string.
+          description: Search query (trimmed, 1–200 Unicode runes, must contain at least one non-whitespace character, valid UTF-8, no ASCII control chars `\x00-\x1F` or `\x7F`).
           schema:
             type: string
             minLength: 1
             maxLength: 200
+            pattern: '^[^\x00-\x1F\x7F]*\S[^\x00-\x1F\x7F]*$'
+          examples:
+            validUserPrefix:
+              summary: Username prefix or display name
+              value: "alice"
+            validWebSearch:
+              summary: PostgreSQL websearch syntax
+              value: "\"api docs\" -deprecated"
+          x-invalid-examples:
+            invalidEmpty:
+              summary: Whitespace-only query (triggers 422)
+              value: "   "
         - name: type
           in: query
           required: true
-          description: Entity type to search.
+          description: Target entity type (must be exact lowercase `users`, `posts`, or `comments`).
           schema:
             type: string
             enum: [users, posts, comments]
-        - $ref: "#/components/parameters/CursorParam"
+          examples:
+            users:
+              summary: Search users
+              value: "users"
+            posts:
+              summary: Search posts
+              value: "posts"
+            comments:
+              summary: Search comments
+              value: "comments"
+          x-invalid-examples:
+            invalidType:
+              summary: Invalid type (triggers 422)
+              value: "hashtags"
+        - $ref: "#/components/parameters/SearchCursorParam"
         - $ref: "#/components/parameters/LimitParam"
       responses:
         "200":
-          description: Search results.
+          description: Paginated search results.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SearchResponse"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+              examples:
+                usersResult:
+                  summary: Search users response
+                  value:
+                    data:
+                      - id: "550e8400-e29b-41d4-a716-446655440000"
+                        username: "alice_dev"
+                        displayName: "Alice"
+                        avatarUrl: null
+                        role: "user"
+                        followerCount: 42
+                        followingCount: 15
+                        createdAt: "2026-10-01T12:00:00Z"
+                    pagination:
+                      nextCursor: "MjA"
+                      limit: 20
+                      hasMore: true
+                postsResult:
+                  summary: Search posts response
+                  value:
+                    data:
+                      - id: "550e8400-e29b-41d4-a716-446655440010"
+                        authorId: "550e8400-e29b-41d4-a716-446655440000"
+                        author:
+                          id: "550e8400-e29b-41d4-a716-446655440000"
+                          username: "alice_dev"
+                          displayName: "Alice"
+                          avatarUrl: null
+                          role: "user"
+                          followerCount: 42
+                          followingCount: 15
+                          createdAt: "2026-10-01T12:00:00Z"
+                        body: "Shipping our API docs today!"
+                        assets: []
+                        likeCount: 12
+                        commentCount: 3
+                        shareCount: 1
+                        liked: null
+                        createdAt: "2026-11-26T15:49:26Z"
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
+                emptyResult:
+                  summary: No matches (guaranteed non-null empty array)
+                  value:
+                    data: []
+                    pagination:
+                      nextCursor: null
+                      limit: 20
+                      hasMore: false
         "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+          description: Missing/invalid `q`, `type`, or `cursor`.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestIDResponse"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                missingQuery:
+                  summary: ValidationError - Missing or empty 'q'
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "Query parameter 'q' is required."
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidType:
+                  summary: ValidationError - Missing or invalid 'type'
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "Query parameter 'type' must be one of: users, posts, comments."
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                queryTooLong:
+                  summary: ValidationError - 'q' exceeds 200 characters
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: query parameter 'q' must not exceed 200 characters"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
+                invalidCursor:
+                  summary: ValidationError - Invalid or negative search cursor
+                  value:
+                    type: "https://api.spill.social/problems/validation-error"
+                    title: "Unprocessable Entity"
+                    status: 422
+                    detail: "validation error: invalid search cursor"
+                    requestId: "req_1a2b3c4d5e6f7a8b9c0d1e2f"
         "500":
           $ref: "#/components/responses/InternalServerError"
+      x-team-notes:
+        frontend:
+          - "`type` check in `SearchController.Search` is case-sensitive (`\"Users\"` returns `422`)."
+          - "`SearchResponse.data` is always an array (`[]` when empty), unlike `/feed`, `/users/{id}/posts`, `/users/{id}/followers`, `/users/{id}/following`, and `/posts/{id}/comments` which return `null` when empty."
+          - "`cursor` is offset-based (`base64.RawURLEncoding` of integer offset), so deep pages may shift if new matching records are inserted between requests."
+        qa:
+          - "Verify `q` supports PostgreSQL `websearch_to_tsquery` operators (quotes, `-negation`, `OR`) without SQL syntax errors."
+          - "Verify soft-deleted posts and comments never appear in search results."
