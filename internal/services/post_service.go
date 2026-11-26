@@ -8,6 +8,7 @@ import (
 
 	"github.com/TheAmgadX/Spill-Social-Media-Platform/internal/models"
 	"github.com/TheAmgadX/Spill-Social-Media-Platform/internal/views"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type PostRepository interface {
@@ -92,6 +93,13 @@ func (s *PostService) CreatePost(ctx context.Context, authorID, body string, ass
 		var trgErr *models.TriggerError
 		if errors.As(err, &trgErr) {
 			return nil, fmt.Errorf("%w: %s", ErrValidation, trgErr.Message)
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "P0001", "23503", "23505", "23514":
+				return nil, fmt.Errorf("%w: %s", ErrValidation, pgErr.Message)
+			}
 		}
 		return nil, err
 	}

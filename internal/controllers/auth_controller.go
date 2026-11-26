@@ -63,13 +63,13 @@ func (c *AuthController) RequestCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	trimmedEmail := strings.TrimSpace(req.Email)
-	if trimmedEmail == "" || !strings.Contains(trimmedEmail, "@") {
-		views.WriteProblem(w, r, http.StatusUnprocessableEntity, "valid email is required")
+	normalizedEmail, err := services.ValidateRequestCode(req.Email)
+	if err != nil {
+		views.WriteProblem(w, r, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 
-	_ = c.authService.RequestCode(r.Context(), trimmedEmail)
+	_ = c.authService.RequestCode(r.Context(), normalizedEmail)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -178,7 +178,8 @@ func (c *AuthController) Signup(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, services.ErrInvalidUsername) ||
 			errors.Is(err, services.ErrInvalidDisplayName) ||
 			errors.Is(err, services.ErrInvalidBirthdate) ||
-			errors.Is(err, services.ErrUnderage) {
+			errors.Is(err, services.ErrUnderage) ||
+			errors.Is(err, services.ErrValidation) {
 			views.WriteProblem(w, r, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
