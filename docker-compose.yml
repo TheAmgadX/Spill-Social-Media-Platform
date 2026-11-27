@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: spill
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: spill_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/docker-init-role.sql:/docker-entrypoint-initdb.d/00_init_role.sql:ro
+      - ./migrations/000001_init.up.sql:/docker-entrypoint-initdb.d/01_init.up.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d spill"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: development
+      HTTP_PORT: "8080"
+      DATABASE_URL: ${DATABASE_URL:-postgres://api_app:api_app_password@postgres:5432/spill?sslmode=disable}
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-postgres://postgres:spill_password@postgres:5432/spill?sslmode=disable}
+      JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-key-must-be-at-least-32-chars!!}
+      OTP_HMAC_KEY: ${OTP_HMAC_KEY:-dev-only-otp-hmac-key-must-be-at-least-32-chars!!}
+      MAILER: ${MAILER:-mailpit}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-media}
+      STORAGE_PUBLIC_BASE_URL: ${STORAGE_PUBLIC_BASE_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
