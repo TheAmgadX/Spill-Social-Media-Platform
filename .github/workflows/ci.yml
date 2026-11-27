@@ -26,7 +26,7 @@ jobs:
         run: go vet ./...
 
       - name: Run unit tests
-        run: go test $$(go list ./... | grep -v '/tests/e2e') -race -v
+        run: go test $(go list ./... | grep -v '/tests/e2e') -race -v
 
       - name: Build binary
         run: mkdir -p bin && go build -o bin/spill-api ./cmd/main.go
